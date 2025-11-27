@@ -10,6 +10,9 @@ A Golang Discord bot that watches a folder for new images and automatically uplo
 - 🔄 Recursive directory watching (monitors all subdirectories)
 - 🛡️ Duplicate prevention with cooldown system
 - 📊 File size validation (respects Discord's 8MB limit)
+- 🌐 Built-in HTTP server with health check endpoints
+- 📝 Structured JSON logging with zerolog
+- ✅ Graceful shutdown handling
 
 ## Setup
 
@@ -39,6 +42,7 @@ Set the following environment variables:
 export DISCORD_TOKEN="your-bot-token-here"
 export DISCORD_CHANNEL_ID="your-channel-id-here"
 export WATCH_DIR="$HOME/Dropbox/Photos/gallery-dl"  # Optional, defaults to this path
+export PORT="8080"  # Optional, defaults to 8080
 ```
 
 Or create a `.env` file (see `.env.example`)
@@ -60,8 +64,9 @@ Once the bot is running:
 
 1. It will automatically watch the configured directory and all subdirectories
 2. When a new image file is created or modified, it will be uploaded to Discord
-3. The bot will log all activity to the console
-4. Press Ctrl+C to stop the bot
+3. The bot will log all activity to the console in JSON format
+4. The HTTP server will be available for health checks
+5. Press Ctrl+C to gracefully stop the bot
 
 ## Configuration
 
@@ -70,6 +75,14 @@ Once the bot is running:
 | `DISCORD_TOKEN` | Yes | - | Your Discord bot token |
 | `DISCORD_CHANNEL_ID` | Yes | - | The Discord channel ID to upload images to |
 | `WATCH_DIR` | No | `~/Dropbox/Photos/gallery-dl` | The directory to watch for new images |
+| `PORT` | No | `8080` | HTTP server port for health checks |
+
+## HTTP Endpoints
+
+The bot includes a built-in HTTP server for monitoring:
+
+- `GET /health` - Basic health check (always returns 200 if server is running)
+- `GET /ready` - Readiness check (returns 200 if Discord is connected, 503 otherwise)
 
 ## How It Works
 
