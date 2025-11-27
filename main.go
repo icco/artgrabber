@@ -137,6 +137,9 @@ func main() {
 	r.Use(zerologMiddleware)
 	r.Use(middleware.Recoverer)
 
+	// Homepage
+	r.Get("/", homepageHandler)
+
 	// Health check endpoints
 	r.Get("/health", healthCheckHandler)
 	r.Get("/ready", readyCheckHandler(dg))
@@ -408,6 +411,179 @@ func zerologMiddleware(next http.Handler) http.Handler {
 			Str("request_id", middleware.GetReqID(r.Context())).
 			Msg("HTTP request")
 	})
+}
+
+// homepageHandler displays the homepage with last image stats
+func homepageHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	var lastProcessed sql.NullString
+	var totalCount int
+	var lastPath sql.NullString
+
+	// Get the most recent processed file
+	err := db.QueryRow(`
+		SELECT processed_at, path
+		FROM processed_files
+		ORDER BY processed_at DESC
+		LIMIT 1
+	`).Scan(&lastProcessed, &lastPath)
+
+	if err != nil && err != sql.ErrNoRows {
+		log.Error().Err(err).Msg("Error querying last processed file")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Get total count
+	err = db.QueryRow(`SELECT COUNT(*) FROM processed_files`).Scan(&totalCount)
+	if err != nil {
+		log.Error().Err(err).Msg("Error querying total count")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Format the time
+	var timeStr string
+	var relativeTime string
+	if lastProcessed.Valid {
+		parsedTime, err := time.Parse(time.RFC3339, lastProcessed.String)
+		if err == nil {
+			timeStr = parsedTime.Format("2006-01-02 15:04:05 MST")
+
+			// Calculate relative time
+			duration := time.Since(parsedTime)
+			switch {
+			case duration < time.Minute:
+				relativeTime = "just now"
+			case duration < time.Hour:
+				minutes := int(duration.Minutes())
+				if minutes == 1 {
+					relativeTime = "1 minute ago"
+				} else {
+					relativeTime = fmt.Sprintf("%d minutes ago", minutes)
+				}
+			case duration < 24*time.Hour:
+				hours := int(duration.Hours())
+				if hours == 1 {
+					relativeTime = "1 hour ago"
+				} else {
+					relativeTime = fmt.Sprintf("%d hours ago", hours)
+				}
+			default:
+				days := int(duration.Hours() / 24)
+				if days == 1 {
+					relativeTime = "1 day ago"
+				} else {
+					relativeTime = fmt.Sprintf("%d days ago", days)
+				}
+			}
+		}
+	} else {
+		timeStr = "Never"
+		relativeTime = "No images processed yet"
+	}
+
+	// Get filename from path
+	var filename string
+	if lastPath.Valid {
+		filename = filepath.Base(lastPath.String)
+	}
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ArtGrabber Status</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-top: 0;
+        }
+        .stat {
+            margin: 20px 0;
+            padding: 15px;
+            background: #f9f9f9;
+            border-radius: 4px;
+            border-left: 4px solid #5865F2;
+        }
+        .label {
+            font-weight: 600;
+            color: #666;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .value {
+            font-size: 24px;
+            color: #333;
+            margin-top: 5px;
+        }
+        .relative-time {
+            color: #666;
+            font-size: 16px;
+            margin-top: 5px;
+        }
+        .filename {
+            color: #5865F2;
+            font-family: monospace;
+            font-size: 14px;
+            margin-top: 5px;
+            word-break: break-all;
+        }
+        .footer {
+            margin-top: 30px;
+            text-align: center;
+            color: #999;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎨 ArtGrabber Status</h1>
+
+        <div class="stat">
+            <div class="label">Last Image Grabbed</div>
+            <div class="value">%s</div>
+            <div class="relative-time">%s</div>
+            %s
+        </div>
+
+        <div class="stat">
+            <div class="label">Total Images Processed</div>
+            <div class="value">%d</div>
+        </div>
+
+        <div class="footer">
+            Polling every %s • <a href="/health">Health</a> • <a href="/ready">Ready</a>
+        </div>
+    </div>
+</body>
+</html>`, timeStr, relativeTime, func() string {
+		if filename != "" {
+			return fmt.Sprintf(`<div class="filename">%s</div>`, filename)
+		}
+		return ""
+	}(), totalCount, pollInterval)
+
+	if _, err := w.Write([]byte(html)); err != nil {
+		log.Error().Err(err).Msg("Error writing homepage response")
+	}
 }
 
 // healthCheckHandler returns a simple health check
