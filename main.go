@@ -72,7 +72,11 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error opening Discord connection")
 	}
-	defer dg.Close()
+	defer func() {
+		if err := dg.Close(); err != nil {
+			log.Error().Err(err).Msg("Error closing Discord connection")
+		}
+	}()
 
 	log.Info().Msg("Bot is now running. Watching for new files...")
 
@@ -81,7 +85,11 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error creating file watcher")
 	}
-	defer watcher.Close()
+	defer func() {
+		if err := watcher.Close(); err != nil {
+			log.Error().Err(err).Msg("Error closing file watcher")
+		}
+	}()
 
 	// Add the main directory and all subdirectories to the watcher
 	err = addDirRecursive(watcher, watchDir)
@@ -174,8 +182,12 @@ func main() {
 
 	// Start HTTP server
 	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: r,
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
@@ -235,11 +247,16 @@ func isImageFile(filename string) bool {
 
 // uploadImageToDiscord uploads an image file to the specified Discord channel
 func uploadImageToDiscord(s *discordgo.Session, channelID, filePath string) error {
+	// #nosec G304 -- filePath comes from filesystem watcher, not user input
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			log.Error().Err(err).Str("file", filePath).Msg("Error closing file")
+		}
+	}()
 
 	// Get file info for size check
 	fileInfo, err := file.Stat()
@@ -289,7 +306,9 @@ func zerologMiddleware(next http.Handler) http.Handler {
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"ok"}`))
+	if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
+		log.Error().Err(err).Msg("Error writing health check response")
+	}
 }
 
 // readyCheckHandler returns readiness status including Discord connection
@@ -298,13 +317,17 @@ func readyCheckHandler(dg *discordgo.Session) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 
 		// Check if Discord session is ready
-		if dg == nil || dg.DataReady == false {
+		if dg == nil || !dg.DataReady {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte(`{"status":"not_ready","discord":"disconnected"}`))
+			if _, err := w.Write([]byte(`{"status":"not_ready","discord":"disconnected"}`)); err != nil {
+				log.Error().Err(err).Msg("Error writing ready check response")
+			}
 			return
 		}
 
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ready","discord":"connected"}`))
+		if _, err := w.Write([]byte(`{"status":"ready","discord":"connected"}`)); err != nil {
+			log.Error().Err(err).Msg("Error writing ready check response")
+		}
 	}
 }
