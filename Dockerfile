@@ -26,11 +26,17 @@ RUN apk --no-cache add ca-certificates
 
 WORKDIR /root/
 
+# Create /data directory for SQLite database
+RUN mkdir -p /data && chmod 755 /data
+
 # Copy the binary from builder
 COPY --from=builder /app/artgrabber .
 
 # Expose the HTTP server port
 EXPOSE 8080
+
+# Define volume for persistent database storage
+VOLUME ["/data"]
 
 # Run the bot
 CMD ["./artgrabber"]
