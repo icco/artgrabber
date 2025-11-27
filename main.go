@@ -191,7 +191,7 @@ func main() {
 // initDB initializes the SQLite database
 func initDB() (*sql.DB, error) {
 	// Ensure data directory exists
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
@@ -214,7 +214,9 @@ func initDB() (*sql.DB, error) {
 	`
 
 	if _, err := database.Exec(schema); err != nil {
-		database.Close()
+		if closeErr := database.Close(); closeErr != nil {
+			log.Error().Err(closeErr).Msg("Error closing database after schema creation failure")
+		}
 		return nil, fmt.Errorf("failed to create schema: %w", err)
 	}
 
@@ -310,7 +312,7 @@ func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient f
 		log.Info().
 			Str("path", fileMetadata.PathDisplay).
 			Str("name", fileMetadata.Name).
-			Int64("size", int64(fileMetadata.Size)).
+			Uint64("size", fileMetadata.Size).
 			Msg("New image detected")
 
 		// Download and upload the file
@@ -397,7 +399,11 @@ func downloadAndUpload(ctx context.Context, dbxClient files.Client, dg *discordg
 	if err != nil {
 		return fmt.Errorf("failed to download from Dropbox: %w", err)
 	}
-	defer content.Close()
+	defer func() {
+		if closeErr := content.Close(); closeErr != nil {
+			log.Error().Err(closeErr).Msg("Error closing Dropbox content stream")
+		}
+	}()
 
 	// Read file content into memory
 	data, err := io.ReadAll(content)
