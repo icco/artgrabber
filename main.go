@@ -1,89 +1,333 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/fsnotify/fsnotify"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 var (
-	// Bot token from environment
-	Token string
+	token     string
+	channelID string
+	watchDir  string
+	port      string
 )
 
-func init() {
-	Token = os.Getenv("DISCORD_BOT_TOKEN")
-	if Token == "" {
-		log.Fatal("DISCORD_BOT_TOKEN environment variable is required")
-	}
-}
-
 func main() {
-	// Create a new Discord session using the provided bot token
-	dg, err := discordgo.New("Bot " + Token)
-	if err != nil {
-		log.Fatalf("Error creating Discord session: %v", err)
+	// Initialize zerolog for JSON logging
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
+
+	// Load configuration from environment variables
+	token = os.Getenv("DISCORD_BOT_TOKEN")
+	channelID = os.Getenv("DISCORD_CHANNEL_ID")
+	watchDir = os.Getenv("WATCH_DIR")
+	port = os.Getenv("PORT")
+
+	if token == "" {
+		log.Fatal().Msg("DISCORD_BOT_TOKEN environment variable is required")
+	}
+	if channelID == "" {
+		log.Fatal().Msg("DISCORD_CHANNEL_ID environment variable is required")
+	}
+	if watchDir == "" {
+		// Default to ~/Dropbox/Photos/gallery-dl/
+		home, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to get user home directory")
+		}
+		watchDir = filepath.Join(home, "Dropbox", "Photos", "gallery-dl")
+	}
+	if port == "" {
+		port = "8080"
 	}
 
-	// Register the messageCreate func as a callback for MessageCreate events
-	dg.AddHandler(messageCreate)
+	log.Info().
+		Str("watch_dir", watchDir).
+		Str("channel_id", channelID).
+		Str("port", port).
+		Msg("Starting ArtGrabber bot")
 
-	// Register the ready event handler
-	dg.AddHandler(ready)
+	// Create Discord session
+	dg, err := discordgo.New("Bot " + token)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Error creating Discord session")
+	}
 
-	// Set intents for the bot
-	dg.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsDirectMessages | discordgo.IntentsMessageContent
-
-	// Open a websocket connection to Discord and begin listening
+	// Open Discord connection
 	err = dg.Open()
 	if err != nil {
-		log.Fatalf("Error opening connection: %v", err)
+		log.Fatal().Err(err).Msg("Error opening Discord connection")
 	}
-	defer dg.Close()
+	defer func() {
+		if err := dg.Close(); err != nil {
+			log.Error().Err(err).Msg("Error closing Discord connection")
+		}
+	}()
 
-	// Wait here until CTRL-C or other term signal is received
-	fmt.Println("Bot is now running. Press CTRL-C to exit.")
+	log.Info().Msg("Bot is now running. Watching for new files...")
+
+	// Create file watcher
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatal().Err(err).Msg("Error creating file watcher")
+	}
+	defer func() {
+		if err := watcher.Close(); err != nil {
+			log.Error().Err(err).Msg("Error closing file watcher")
+		}
+	}()
+
+	// Add the main directory and all subdirectories to the watcher
+	err = addDirRecursive(watcher, watchDir)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Error adding directories to watcher")
+	}
+
+	// Track recently uploaded files to avoid duplicates
+	recentUploads := make(map[string]time.Time)
+	uploadCooldown := 5 * time.Second
+
+	// Watch for file system events
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+
+				// Only process create and write events
+				if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
+					// Check if it's a new directory, and if so, add it to the watcher
+					if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+						err := addDirRecursive(watcher, event.Name)
+						if err != nil {
+							log.Error().Err(err).Str("directory", event.Name).Msg("Error adding new directory to watcher")
+						}
+						continue
+					}
+
+					// Check if it's an image file
+					if isImageFile(event.Name) {
+						// Check cooldown to avoid duplicate uploads
+						if lastUpload, exists := recentUploads[event.Name]; exists {
+							if time.Since(lastUpload) < uploadCooldown {
+								continue
+							}
+						}
+
+						// Small delay to ensure file is fully written
+						time.Sleep(500 * time.Millisecond)
+
+						log.Info().Str("file", event.Name).Msg("New image detected")
+						err := uploadImageToDiscord(dg, channelID, event.Name)
+						if err != nil {
+							log.Error().Err(err).Str("file", event.Name).Msg("Error uploading image")
+						} else {
+							recentUploads[event.Name] = time.Now()
+							log.Info().Str("filename", filepath.Base(event.Name)).Msg("Successfully uploaded")
+						}
+					}
+				}
+
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Error().Err(err).Msg("Watcher error")
+			}
+		}
+	}()
+
+	// Cleanup old entries from recentUploads map periodically
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			for path, uploadTime := range recentUploads {
+				if now.Sub(uploadTime) > 5*time.Minute {
+					delete(recentUploads, path)
+				}
+			}
+		}
+	}()
+
+	// Setup Chi web server
+	r := chi.NewRouter()
+
+	// Middleware
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(zerologMiddleware)
+	r.Use(middleware.Recoverer)
+
+	// Health check endpoints
+	r.Get("/health", healthCheckHandler)
+	r.Get("/ready", readyCheckHandler(dg))
+
+	// Start HTTP server
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	go func() {
+		log.Info().Str("port", port).Msg("Starting HTTP server")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal().Err(err).Msg("HTTP server error")
+		}
+	}()
+
+	// Wait for interrupt signal
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-sc
-}
 
-// ready is called when the bot is connected to Discord
-func ready(s *discordgo.Session, event *discordgo.Ready) {
-	log.Printf("Bot is ready! Logged in as: %v", event.User.Username)
-	// Set the playing status
-	s.UpdateGameStatus(0, "Art Grabber | !help")
-}
+	log.Info().Msg("Shutting down gracefully...")
 
-// messageCreate is called whenever a message is created in a channel the bot can see
-func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
-	// Ignore all messages created by the bot itself
-	if m.Author.ID == s.State.User.ID {
-		return
+	// Graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Error().Err(err).Msg("HTTP server shutdown error")
 	}
 
-	// Respond to !ping command
-	if m.Content == "!ping" {
-		_, err := s.ChannelMessageSend(m.ChannelID, "Pong!")
+	log.Info().Msg("Shutdown complete")
+}
+
+// addDirRecursive adds a directory and all its subdirectories to the watcher
+func addDirRecursive(watcher *fsnotify.Watcher, dir string) error {
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			log.Printf("Error sending message: %v", err)
+			return err
+		}
+		if info.IsDir() {
+			err = watcher.Add(path)
+			if err != nil {
+				return fmt.Errorf("failed to watch %s: %w", path, err)
+			}
+			log.Debug().Str("path", path).Msg("Watching directory")
+		}
+		return nil
+	})
+	return err
+}
+
+// isImageFile checks if a file is an image based on extension
+func isImageFile(filename string) bool {
+	ext := strings.ToLower(filepath.Ext(filename))
+	imageExtensions := []string{".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+	for _, imgExt := range imageExtensions {
+		if ext == imgExt {
+			return true
 		}
 	}
+	return false
+}
 
-	// Respond to !help command
-	if m.Content == "!help" {
-		helpMessage := `**Art Grabber Bot Commands:**
-!ping - Check if the bot is responsive
-!help - Display this help message
+// uploadImageToDiscord uploads an image file to the specified Discord channel
+func uploadImageToDiscord(s *discordgo.Session, channelID, filePath string) error {
+	// #nosec G304 -- filePath comes from filesystem watcher, not user input
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			log.Error().Err(err).Str("file", filePath).Msg("Error closing file")
+		}
+	}()
 
-This bot is designed to grab and share art content.`
-		_, err := s.ChannelMessageSend(m.ChannelID, helpMessage)
-		if err != nil {
-			log.Printf("Error sending message: %v", err)
+	// Get file info for size check
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	// Discord has a file size limit (8MB for free, 50MB for Nitro)
+	// We'll use 8MB as the safe limit
+	maxSize := int64(8 * 1024 * 1024)
+	if fileInfo.Size() > maxSize {
+		return fmt.Errorf("file size (%d bytes) exceeds Discord limit (8MB)", fileInfo.Size())
+	}
+
+	filename := filepath.Base(filePath)
+
+	// Send the file to Discord
+	_, err = s.ChannelFileSend(channelID, filename, file)
+	if err != nil {
+		return fmt.Errorf("failed to send file to Discord: %w", err)
+	}
+
+	return nil
+}
+
+// zerologMiddleware adds zerolog logging to HTTP requests
+func zerologMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		next.ServeHTTP(ww, r)
+
+		log.Info().
+			Str("method", r.Method).
+			Str("path", r.URL.Path).
+			Int("status", ww.Status()).
+			Int("size", ww.BytesWritten()).
+			Dur("duration_ms", time.Since(start)).
+			Str("remote_addr", r.RemoteAddr).
+			Str("request_id", middleware.GetReqID(r.Context())).
+			Msg("HTTP request")
+	})
+}
+
+// healthCheckHandler returns a simple health check
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
+		log.Error().Err(err).Msg("Error writing health check response")
+	}
+}
+
+// readyCheckHandler returns readiness status including Discord connection
+func readyCheckHandler(dg *discordgo.Session) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Check if Discord session is ready
+		if dg == nil || !dg.DataReady {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			if _, err := w.Write([]byte(`{"status":"not_ready","discord":"disconnected"}`)); err != nil {
+				log.Error().Err(err).Msg("Error writing ready check response")
+			}
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte(`{"status":"ready","discord":"connected"}`)); err != nil {
+			log.Error().Err(err).Msg("Error writing ready check response")
 		}
 	}
 }

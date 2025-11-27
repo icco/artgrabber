@@ -1,0 +1,84 @@
+version: '3'
+
+vars:
+  BINARY_NAME: artgrabber
+  DOCKER_IMAGE: artgrabber
+  DOCKER_TAG: latest
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build the bot binary
+    cmds:
+      - go build -v -o {{.BINARY_NAME}} .
+    sources:
+      - main.go
+      - go.mod
+      - go.sum
+    generates:
+      - "{{.BINARY_NAME}}"
+
+  run:
+    desc: Run the bot directly
+    cmds:
+      - go run main.go
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -f {{.BINARY_NAME}}
+      - rm -f {{.BINARY_NAME}}-*
+
+  test:
+    desc: Run tests
+    cmds:
+      - go test -v ./...
+
+  lint:
+    desc: Run linters
+    cmds:
+      - go fmt ./...
+      - go vet ./...
+
+  tidy:
+    desc: Tidy go modules
+    cmds:
+      - go mod tidy
+
+  docker:build:
+    desc: Build Docker image
+    cmds:
+      - docker build -t {{.DOCKER_IMAGE}}:{{.DOCKER_TAG}} .
+
+  docker:run:
+    desc: Run Docker container
+    cmds:
+      - docker run --rm --env-file .env -p 8080:8080 {{.DOCKER_IMAGE}}:{{.DOCKER_TAG}}
+
+  docker:push:
+    desc: Push Docker image to registry
+    cmds:
+      - docker push {{.DOCKER_IMAGE}}:{{.DOCKER_TAG}}
+
+  build-all:
+    desc: Build for multiple platforms
+    cmds:
+      - GOOS=linux GOARCH=amd64 go build -o {{.BINARY_NAME}}-linux-amd64 .
+      - GOOS=darwin GOARCH=amd64 go build -o {{.BINARY_NAME}}-darwin-amd64 .
+      - GOOS=darwin GOARCH=arm64 go build -o {{.BINARY_NAME}}-darwin-arm64 .
+      - GOOS=windows GOARCH=amd64 go build -o {{.BINARY_NAME}}-windows-amd64.exe .
+
+  dev:
+    desc: Run in development mode with auto-reload
+    deps: [build]
+    cmds:
+      - ./{{.BINARY_NAME}}
+
+  install:
+    desc: Install the bot to $GOPATH/bin
+    cmds:
+      - go install .

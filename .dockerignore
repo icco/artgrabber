@@ -1,0 +1,25 @@
+# Git files
+.git
+.gitignore
+
+# Environment files
+.env
+.env.example
+
+# Documentation
+README.md
+LICENSE
+
+# Build artifacts
+artgrabber
+artgrabber-*
+
+# IDE files
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Test files
+*_test.go

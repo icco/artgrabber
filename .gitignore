@@ -28,6 +28,9 @@ go.work.sum
 # env file
 .env
 
+# Built binary
+artgrabber
+
 # Editor/IDE
 # .idea/
 # .vscode/
