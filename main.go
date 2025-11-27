@@ -272,6 +272,9 @@ func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordg
 
 // processEntries processes a batch of Dropbox entries
 func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient files.Client, dg *discordgo.Session) {
+	const maxBatchSize = 5
+	var batch []*files.FileMetadata
+
 	for _, entry := range entries {
 		select {
 		case <-ctx.Done():
@@ -295,50 +298,67 @@ func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient f
 			continue
 		}
 
-		// Check rate limit before processing
-		uploadMutex.Lock()
-		timeSinceLastUpload := time.Since(lastUploadTime)
-		if timeSinceLastUpload < uploadRateLimit {
-			uploadMutex.Unlock()
-			waitTime := uploadRateLimit - timeSinceLastUpload
-			log.Debug().
-				Str("path", fileMetadata.PathDisplay).
-				Dur("wait_time", waitTime).
-				Msg("Rate limit: skipping file, will retry on next poll")
-			continue
+		// Add to batch
+		batch = append(batch, fileMetadata)
+
+		// Process batch when we have 5 files or this is the last entry
+		if len(batch) >= maxBatchSize {
+			processBatch(ctx, batch, dbxClient, dg)
+			batch = nil
 		}
+	}
+
+	// Process any remaining files in the batch
+	if len(batch) > 0 {
+		processBatch(ctx, batch, dbxClient, dg)
+	}
+}
+
+// processBatch processes a batch of files and uploads them in a single message
+func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient files.Client, dg *discordgo.Session) {
+	// Check rate limit before processing
+	uploadMutex.Lock()
+	timeSinceLastUpload := time.Since(lastUploadTime)
+	if timeSinceLastUpload < uploadRateLimit {
 		uploadMutex.Unlock()
+		waitTime := uploadRateLimit - timeSinceLastUpload
+		log.Debug().
+			Int("batch_size", len(batch)).
+			Dur("wait_time", waitTime).
+			Msg("Rate limit: skipping batch, will retry on next poll")
+		return
+	}
+	uploadMutex.Unlock()
 
-		log.Info().
-			Str("path", fileMetadata.PathDisplay).
-			Str("name", fileMetadata.Name).
-			Uint64("size", fileMetadata.Size).
-			Msg("New image detected")
+	log.Info().
+		Int("batch_size", len(batch)).
+		Msg("Processing batch of images")
 
-		// Download and upload the file
-		if err := downloadAndUpload(ctx, dbxClient, dg, fileMetadata); err != nil {
-			log.Error().
-				Err(err).
-				Str("path", fileMetadata.PathDisplay).
-				Msg("Failed to process file")
-		} else {
-			// Mark file as processed
+	// Download and upload the batch
+	if err := downloadAndUploadBatch(ctx, dbxClient, dg, batch); err != nil {
+		log.Error().
+			Err(err).
+			Int("batch_size", len(batch)).
+			Msg("Failed to process batch")
+	} else {
+		// Mark all files as processed
+		for _, fileMetadata := range batch {
 			if err := markFileProcessed(fileMetadata); err != nil {
 				log.Error().
 					Err(err).
 					Str("path", fileMetadata.PathDisplay).
 					Msg("Failed to mark file as processed")
 			}
-
-			// Update last upload time after successful upload
-			uploadMutex.Lock()
-			lastUploadTime = time.Now()
-			uploadMutex.Unlock()
-
-			log.Info().
-				Str("filename", fileMetadata.Name).
-				Msg("Rate limit: upload complete, will wait 1 minute before next upload")
 		}
+
+		// Update last upload time after successful upload
+		uploadMutex.Lock()
+		lastUploadTime = time.Now()
+		uploadMutex.Unlock()
+
+		log.Info().
+			Int("batch_size", len(batch)).
+			Msg("Rate limit: batch upload complete, will wait 1 minute before next upload")
 	}
 }
 
@@ -385,89 +405,147 @@ func markFileProcessed(metadata *files.FileMetadata) error {
 	return err
 }
 
-// downloadAndUpload downloads a file from Dropbox and uploads it to Discord
-func downloadAndUpload(ctx context.Context, dbxClient files.Client, dg *discordgo.Session, metadata *files.FileMetadata) error {
-	// Discord has a file size limit (8MB for free, 50MB for Nitro)
-	maxSize := uint64(8 * 1024 * 1024)
-	if metadata.Size > maxSize {
-		return fmt.Errorf("file size (%d bytes) exceeds Discord limit (8MB)", metadata.Size)
-	}
-
+// downloadAndUploadBatch downloads multiple files from Dropbox and uploads them in a single Discord message
+func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *discordgo.Session, batch []*files.FileMetadata) error {
 	// Create cache directory if it doesn't exist
 	cacheDir := filepath.Join(dataDir, "cache")
 	if err := os.MkdirAll(cacheDir, 0750); err != nil {
 		return fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
-	// Create a temporary file in the cache directory
-	// Use a unique name based on the file path hash to avoid collisions
-	cacheFile := filepath.Join(cacheDir, filepath.Base(metadata.PathLower))
+	// Discord has a file size limit (8MB for free, 50MB for Nitro)
+	maxSize := uint64(8 * 1024 * 1024)
 
-	// Download file from Dropbox to cache
-	downloadArg := files.NewDownloadArg(metadata.PathLower)
-	_, content, err := dbxClient.Download(downloadArg)
-	if err != nil {
-		return fmt.Errorf("failed to download from Dropbox: %w", err)
-	}
+	// Download all files and prepare Discord file objects
+	var discordFiles []*discordgo.File
+	var cacheFiles []string
+	var paths []string
+	var fileNames []string
+
+	// Clean up cache files when done
 	defer func() {
+		for _, cacheFile := range cacheFiles {
+			if removeErr := os.Remove(cacheFile); removeErr != nil {
+				log.Error().Err(removeErr).Str("file", cacheFile).Msg("Error removing cache file")
+			}
+		}
+	}()
+
+	for _, metadata := range batch {
+		// Check file size
+		if metadata.Size > maxSize {
+			log.Warn().
+				Str("path", metadata.PathDisplay).
+				Uint64("size", metadata.Size).
+				Msg("Skipping file: exceeds Discord limit (8MB)")
+			continue
+		}
+
+		// Create a temporary file in the cache directory
+		cacheFile := filepath.Join(cacheDir, filepath.Base(metadata.PathLower))
+
+		// Download file from Dropbox to cache
+		downloadArg := files.NewDownloadArg(metadata.PathLower)
+		_, content, err := dbxClient.Download(downloadArg)
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("path", metadata.PathDisplay).
+				Msg("Failed to download from Dropbox")
+			continue
+		}
+
+		// Write to cache file
+		outFile, err := os.Create(cacheFile)
+		if err != nil {
+			if closeErr := content.Close(); closeErr != nil {
+				log.Error().Err(closeErr).Msg("Error closing Dropbox content stream")
+			}
+			log.Error().
+				Err(err).
+				Str("path", metadata.PathDisplay).
+				Msg("Failed to create cache file")
+			continue
+		}
+
+		if _, err := io.Copy(outFile, content); err != nil {
+			if closeErr := content.Close(); closeErr != nil {
+				log.Error().Err(closeErr).Msg("Error closing Dropbox content stream")
+			}
+			if closeErr := outFile.Close(); closeErr != nil {
+				log.Error().Err(closeErr).Msg("Error closing cache file")
+			}
+			log.Error().
+				Err(err).
+				Str("path", metadata.PathDisplay).
+				Msg("Failed to write to cache file")
+			continue
+		}
+
 		if closeErr := content.Close(); closeErr != nil {
 			log.Error().Err(closeErr).Msg("Error closing Dropbox content stream")
 		}
-	}()
-
-	// Write to cache file
-	outFile, err := os.Create(cacheFile)
-	if err != nil {
-		return fmt.Errorf("failed to create cache file: %w", err)
-	}
-	defer func() {
 		if closeErr := outFile.Close(); closeErr != nil {
 			log.Error().Err(closeErr).Msg("Error closing cache file")
 		}
-		// Clean up cache file after upload attempt
-		if removeErr := os.Remove(cacheFile); removeErr != nil {
-			log.Error().Err(removeErr).Str("file", cacheFile).Msg("Error removing cache file")
+
+		// Open the cached file for reading
+		cachedFile, err := os.Open(cacheFile)
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("path", metadata.PathDisplay).
+				Msg("Failed to open cached file")
+			continue
 		}
-	}()
 
-	if _, err := io.Copy(outFile, content); err != nil {
-		return fmt.Errorf("failed to write to cache file: %w", err)
+		discordFiles = append(discordFiles, &discordgo.File{
+			Name:   metadata.Name,
+			Reader: cachedFile,
+		})
+		cacheFiles = append(cacheFiles, cacheFile)
+		paths = append(paths, metadata.PathDisplay)
+		fileNames = append(fileNames, metadata.Name)
+
+		log.Info().
+			Str("path", metadata.PathDisplay).
+			Str("name", metadata.Name).
+			Uint64("size", metadata.Size).
+			Msg("Downloaded image for batch upload")
 	}
 
-	// Close the file before reopening for reading
-	if err := outFile.Close(); err != nil {
-		return fmt.Errorf("failed to close cache file after writing: %w", err)
+	// If no files were successfully downloaded, return an error
+	if len(discordFiles) == 0 {
+		return fmt.Errorf("no files were successfully downloaded from batch")
 	}
 
-	// Open the cached file for reading
-	cachedFile, err := os.Open(cacheFile)
-	if err != nil {
-		return fmt.Errorf("failed to open cached file: %w", err)
-	}
+	// Close all file handles after sending
 	defer func() {
-		if closeErr := cachedFile.Close(); closeErr != nil {
-			log.Error().Err(closeErr).Msg("Error closing cached file")
+		for _, df := range discordFiles {
+			if closer, ok := df.Reader.(io.Closer); ok {
+				if closeErr := closer.Close(); closeErr != nil {
+					log.Error().Err(closeErr).Msg("Error closing file reader")
+				}
+			}
 		}
 	}()
 
-	// Send the file to Discord with the file path in the message
-	_, err = dg.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
-		Content: metadata.PathDisplay,
-		Files: []*discordgo.File{
-			{
-				Name:   metadata.Name,
-				Reader: cachedFile,
-			},
-		},
+	// Create message content with all file paths
+	messageContent := strings.Join(paths, "\n")
+
+	// Send all files to Discord in a single message
+	_, err := dg.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Content: messageContent,
+		Files:   discordFiles,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to send file to Discord: %w", err)
+		return fmt.Errorf("failed to send files to Discord: %w", err)
 	}
 
 	log.Info().
-		Str("filename", metadata.Name).
-		Str("path", metadata.PathDisplay).
-		Msg("Successfully uploaded to Discord")
+		Int("file_count", len(discordFiles)).
+		Strs("files", fileNames).
+		Msg("Successfully uploaded batch to Discord")
 
 	return nil
 }
