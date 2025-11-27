@@ -57,6 +57,7 @@ export DISCORD_BOT_TOKEN="your-bot-token-here"
 export DISCORD_CHANNEL_ID="your-channel-id-here"
 export DROPBOX_ACCESS_TOKEN="your-dropbox-token-here"
 export DROPBOX_FOLDER="/Photos/gallery-dl"  # Optional, defaults to this path
+export DATA_DIR="/data"  # Optional, defaults to /data
 export POLL_INTERVAL="5m"  # Optional, defaults to 5 minutes
 export PORT="8080"  # Optional, defaults to 8080
 ```

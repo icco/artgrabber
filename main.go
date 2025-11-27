@@ -30,6 +30,7 @@ var (
 	dropboxFolder  string
 	pollInterval   time.Duration
 	port           string
+	dataDir        string
 	db             *sql.DB
 )
 
@@ -43,6 +44,7 @@ func main() {
 	channelID = os.Getenv("DISCORD_CHANNEL_ID")
 	dropboxToken = os.Getenv("DROPBOX_ACCESS_TOKEN")
 	dropboxFolder = os.Getenv("DROPBOX_FOLDER")
+	dataDir = os.Getenv("DATA_DIR")
 	port = os.Getenv("PORT")
 	pollIntervalStr := os.Getenv("POLL_INTERVAL")
 
@@ -57,6 +59,9 @@ func main() {
 	}
 	if dropboxFolder == "" {
 		dropboxFolder = "/Photos/gallery-dl"
+	}
+	if dataDir == "" {
+		dataDir = "/data"
 	}
 	if port == "" {
 		port = "8080"
@@ -74,6 +79,7 @@ func main() {
 	log.Info().
 		Str("dropbox_folder", dropboxFolder).
 		Str("channel_id", channelID).
+		Str("data_dir", dataDir).
 		Str("port", port).
 		Dur("poll_interval", pollInterval).
 		Msg("Starting ArtGrabber bot")
@@ -175,12 +181,12 @@ func main() {
 
 // initDB initializes the SQLite database
 func initDB() (*sql.DB, error) {
-	// Ensure /data directory exists
-	if err := os.MkdirAll("/data", 0755); err != nil {
-		return nil, fmt.Errorf("failed to create /data directory: %w", err)
+	// Ensure data directory exists
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
-	dbPath := "/data/artgrabber.db"
+	dbPath := filepath.Join(dataDir, "artgrabber.db")
 	database, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
