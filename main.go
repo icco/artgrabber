@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,18 +14,23 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/fsnotify/fsnotify"
+	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox"
+	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/files"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	_ "modernc.org/sqlite"
 )
 
 var (
-	token     string
-	channelID string
-	watchDir  string
-	port      string
+	discordToken   string
+	channelID      string
+	dropboxToken   string
+	dropboxFolder  string
+	pollInterval   time.Duration
+	port           string
+	db             *sql.DB
 )
 
 func main() {
@@ -32,37 +39,59 @@ func main() {
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
 
 	// Load configuration from environment variables
-	token = os.Getenv("DISCORD_BOT_TOKEN")
+	discordToken = os.Getenv("DISCORD_BOT_TOKEN")
 	channelID = os.Getenv("DISCORD_CHANNEL_ID")
-	watchDir = os.Getenv("WATCH_DIR")
+	dropboxToken = os.Getenv("DROPBOX_ACCESS_TOKEN")
+	dropboxFolder = os.Getenv("DROPBOX_FOLDER")
 	port = os.Getenv("PORT")
+	pollIntervalStr := os.Getenv("POLL_INTERVAL")
 
-	if token == "" {
+	if discordToken == "" {
 		log.Fatal().Msg("DISCORD_BOT_TOKEN environment variable is required")
 	}
 	if channelID == "" {
 		log.Fatal().Msg("DISCORD_CHANNEL_ID environment variable is required")
 	}
-	if watchDir == "" {
-		// Default to ~/Dropbox/Photos/gallery-dl/
-		home, err := os.UserHomeDir()
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to get user home directory")
-		}
-		watchDir = filepath.Join(home, "Dropbox", "Photos", "gallery-dl")
+	if dropboxToken == "" {
+		log.Fatal().Msg("DROPBOX_ACCESS_TOKEN environment variable is required")
+	}
+	if dropboxFolder == "" {
+		dropboxFolder = "/Photos/gallery-dl"
 	}
 	if port == "" {
 		port = "8080"
 	}
+	if pollIntervalStr == "" {
+		pollInterval = 5 * time.Minute
+	} else {
+		var err error
+		pollInterval, err = time.ParseDuration(pollIntervalStr)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Invalid POLL_INTERVAL format")
+		}
+	}
 
 	log.Info().
-		Str("watch_dir", watchDir).
+		Str("dropbox_folder", dropboxFolder).
 		Str("channel_id", channelID).
 		Str("port", port).
+		Dur("poll_interval", pollInterval).
 		Msg("Starting ArtGrabber bot")
 
+	// Initialize database
+	var err error
+	db, err = initDB()
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to initialize database")
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			log.Error().Err(err).Msg("Error closing database")
+		}
+	}()
+
 	// Create Discord session
-	dg, err := discordgo.New("Bot " + token)
+	dg, err := discordgo.New("Bot " + discordToken)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error creating Discord session")
 	}
@@ -78,94 +107,20 @@ func main() {
 		}
 	}()
 
-	log.Info().Msg("Bot is now running. Watching for new files...")
+	log.Info().Msg("Bot is now running. Polling Dropbox for new files...")
 
-	// Create file watcher
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatal().Err(err).Msg("Error creating file watcher")
+	// Create Dropbox client
+	config := dropbox.Config{
+		Token: dropboxToken,
 	}
-	defer func() {
-		if err := watcher.Close(); err != nil {
-			log.Error().Err(err).Msg("Error closing file watcher")
-		}
-	}()
+	dbxClient := files.New(config)
 
-	// Add the main directory and all subdirectories to the watcher
-	err = addDirRecursive(watcher, watchDir)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Error adding directories to watcher")
-	}
+	// Context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Track recently uploaded files to avoid duplicates
-	recentUploads := make(map[string]time.Time)
-	uploadCooldown := 5 * time.Second
-
-	// Watch for file system events
-	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-
-				// Only process create and write events
-				if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
-					// Check if it's a new directory, and if so, add it to the watcher
-					if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-						err := addDirRecursive(watcher, event.Name)
-						if err != nil {
-							log.Error().Err(err).Str("directory", event.Name).Msg("Error adding new directory to watcher")
-						}
-						continue
-					}
-
-					// Check if it's an image file
-					if isImageFile(event.Name) {
-						// Check cooldown to avoid duplicate uploads
-						if lastUpload, exists := recentUploads[event.Name]; exists {
-							if time.Since(lastUpload) < uploadCooldown {
-								continue
-							}
-						}
-
-						// Small delay to ensure file is fully written
-						time.Sleep(500 * time.Millisecond)
-
-						log.Info().Str("file", event.Name).Msg("New image detected")
-						err := uploadImageToDiscord(dg, channelID, event.Name)
-						if err != nil {
-							log.Error().Err(err).Str("file", event.Name).Msg("Error uploading image")
-						} else {
-							recentUploads[event.Name] = time.Now()
-							log.Info().Str("filename", filepath.Base(event.Name)).Msg("Successfully uploaded")
-						}
-					}
-				}
-
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				log.Error().Err(err).Msg("Watcher error")
-			}
-		}
-	}()
-
-	// Cleanup old entries from recentUploads map periodically
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			now := time.Now()
-			for path, uploadTime := range recentUploads {
-				if now.Sub(uploadTime) > 5*time.Minute {
-					delete(recentUploads, path)
-				}
-			}
-		}
-	}()
+	// Start polling Dropbox for new files
+	go pollDropbox(ctx, dbxClient, dg)
 
 	// Setup Chi web server
 	r := chi.NewRouter()
@@ -204,33 +159,147 @@ func main() {
 
 	log.Info().Msg("Shutting down gracefully...")
 
-	// Graceful shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// Cancel polling context
+	cancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
+	// Graceful shutdown
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error().Err(err).Msg("HTTP server shutdown error")
 	}
 
 	log.Info().Msg("Shutdown complete")
 }
 
-// addDirRecursive adds a directory and all its subdirectories to the watcher
-func addDirRecursive(watcher *fsnotify.Watcher, dir string) error {
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+// initDB initializes the SQLite database
+func initDB() (*sql.DB, error) {
+	// Ensure /data directory exists
+	if err := os.MkdirAll("/data", 0755); err != nil {
+		return nil, fmt.Errorf("failed to create /data directory: %w", err)
+	}
+
+	dbPath := "/data/artgrabber.db"
+	database, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Create table for tracking processed files
+	schema := `
+	CREATE TABLE IF NOT EXISTS processed_files (
+		path TEXT PRIMARY KEY,
+		size INTEGER NOT NULL,
+		modified TEXT NOT NULL,
+		processed_at TEXT NOT NULL,
+		uploaded BOOLEAN NOT NULL DEFAULT 1
+	);
+	CREATE INDEX IF NOT EXISTS idx_processed_at ON processed_files(processed_at);
+	`
+
+	if _, err := database.Exec(schema); err != nil {
+		database.Close()
+		return nil, fmt.Errorf("failed to create schema: %w", err)
+	}
+
+	log.Info().Str("db_path", dbPath).Msg("Database initialized")
+	return database, nil
+}
+
+// pollDropbox continuously polls Dropbox for new files
+func pollDropbox(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	// Run immediately on start
+	scanDropboxFolder(ctx, dbxClient, dg)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Msg("Stopping Dropbox polling")
+			return
+		case <-ticker.C:
+			scanDropboxFolder(ctx, dbxClient, dg)
+		}
+	}
+}
+
+// scanDropboxFolder scans the Dropbox folder for new image files
+func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
+	log.Debug().Msg("Scanning Dropbox folder")
+
+	listArg := files.NewListFolderArg(dropboxFolder)
+	listArg.Recursive = true
+
+	result, err := dbxClient.ListFolder(listArg)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to list Dropbox folder")
+		return
+	}
+
+	processEntries(ctx, result.Entries, dbxClient, dg)
+
+	// Handle pagination
+	for result.HasMore {
+		continueArg := files.NewListFolderContinueArg(result.Cursor)
+		result, err = dbxClient.ListFolderContinue(continueArg)
 		if err != nil {
-			return err
+			log.Error().Err(err).Msg("Failed to continue listing Dropbox folder")
+			return
 		}
-		if info.IsDir() {
-			err = watcher.Add(path)
-			if err != nil {
-				return fmt.Errorf("failed to watch %s: %w", path, err)
+		processEntries(ctx, result.Entries, dbxClient, dg)
+	}
+}
+
+// processEntries processes a batch of Dropbox entries
+func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient files.Client, dg *discordgo.Session) {
+	for _, entry := range entries {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Only process files, not folders
+		fileMetadata, ok := entry.(*files.FileMetadata)
+		if !ok {
+			continue
+		}
+
+		// Check if it's an image file
+		if !isImageFile(fileMetadata.Name) {
+			continue
+		}
+
+		// Check if we've already processed this file
+		if isFileProcessed(fileMetadata) {
+			continue
+		}
+
+		log.Info().
+			Str("path", fileMetadata.PathDisplay).
+			Str("name", fileMetadata.Name).
+			Int64("size", int64(fileMetadata.Size)).
+			Msg("New image detected")
+
+		// Download and upload the file
+		if err := downloadAndUpload(ctx, dbxClient, dg, fileMetadata); err != nil {
+			log.Error().
+				Err(err).
+				Str("path", fileMetadata.PathDisplay).
+				Msg("Failed to process file")
+		} else {
+			// Mark file as processed
+			if err := markFileProcessed(fileMetadata); err != nil {
+				log.Error().
+					Err(err).
+					Str("path", fileMetadata.PathDisplay).
+					Msg("Failed to mark file as processed")
 			}
-			log.Debug().Str("path", path).Msg("Watching directory")
 		}
-		return nil
-	})
-	return err
+	}
 }
 
 // isImageFile checks if a file is an image based on extension
@@ -245,39 +314,72 @@ func isImageFile(filename string) bool {
 	return false
 }
 
-// uploadImageToDiscord uploads an image file to the specified Discord channel
-func uploadImageToDiscord(s *discordgo.Session, channelID, filePath string) error {
-	// #nosec G304 -- filePath comes from filesystem watcher, not user input
-	file, err := os.Open(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to open file: %w", err)
-	}
-	defer func() {
-		if err := file.Close(); err != nil {
-			log.Error().Err(err).Str("file", filePath).Msg("Error closing file")
-		}
-	}()
+// isFileProcessed checks if a file has already been processed
+func isFileProcessed(metadata *files.FileMetadata) bool {
+	var count int
+	err := db.QueryRow(
+		"SELECT COUNT(*) FROM processed_files WHERE path = ? AND size = ? AND modified = ?",
+		metadata.PathLower,
+		metadata.Size,
+		metadata.ServerModified.Format(time.RFC3339),
+	).Scan(&count)
 
-	// Get file info for size check
-	fileInfo, err := file.Stat()
 	if err != nil {
-		return fmt.Errorf("failed to get file info: %w", err)
+		log.Error().Err(err).Msg("Failed to check if file is processed")
+		return false
 	}
 
+	return count > 0
+}
+
+// markFileProcessed marks a file as processed in the database
+func markFileProcessed(metadata *files.FileMetadata) error {
+	_, err := db.Exec(
+		"INSERT OR REPLACE INTO processed_files (path, size, modified, processed_at, uploaded) VALUES (?, ?, ?, ?, ?)",
+		metadata.PathLower,
+		metadata.Size,
+		metadata.ServerModified.Format(time.RFC3339),
+		time.Now().Format(time.RFC3339),
+		true,
+	)
+	return err
+}
+
+// downloadAndUpload downloads a file from Dropbox and uploads it to Discord
+func downloadAndUpload(ctx context.Context, dbxClient files.Client, dg *discordgo.Session, metadata *files.FileMetadata) error {
 	// Discord has a file size limit (8MB for free, 50MB for Nitro)
-	// We'll use 8MB as the safe limit
-	maxSize := int64(8 * 1024 * 1024)
-	if fileInfo.Size() > maxSize {
-		return fmt.Errorf("file size (%d bytes) exceeds Discord limit (8MB)", fileInfo.Size())
+	maxSize := uint64(8 * 1024 * 1024)
+	if metadata.Size > maxSize {
+		return fmt.Errorf("file size (%d bytes) exceeds Discord limit (8MB)", metadata.Size)
 	}
 
-	filename := filepath.Base(filePath)
+	// Download file from Dropbox
+	downloadArg := files.NewDownloadArg(metadata.PathLower)
+	_, content, err := dbxClient.Download(downloadArg)
+	if err != nil {
+		return fmt.Errorf("failed to download from Dropbox: %w", err)
+	}
+	defer content.Close()
+
+	// Read file content into memory
+	data, err := io.ReadAll(content)
+	if err != nil {
+		return fmt.Errorf("failed to read file content: %w", err)
+	}
+
+	// Create a reader from the data
+	reader := strings.NewReader(string(data))
 
 	// Send the file to Discord
-	_, err = s.ChannelFileSend(channelID, filename, file)
+	_, err = dg.ChannelFileSend(channelID, metadata.Name, reader)
 	if err != nil {
 		return fmt.Errorf("failed to send file to Discord: %w", err)
 	}
+
+	log.Info().
+		Str("filename", metadata.Name).
+		Str("path", metadata.PathDisplay).
+		Msg("Successfully uploaded to Discord")
 
 	return nil
 }

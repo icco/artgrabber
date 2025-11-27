@@ -1,19 +1,19 @@
 # ArtGrabber
 
-A Golang Discord bot that watches a folder for new images and automatically uploads them to a Discord channel.
+A Golang Discord bot that monitors a Dropbox folder for new images and automatically uploads them to a Discord channel.
 
 ## Features
 
-- 📁 Watches a directory and all subdirectories for new image files
+- ☁️ Monitors Dropbox folder and all subdirectories via Dropbox API
 - 🖼️ Supports common image formats: JPG, PNG, GIF, WebP, BMP
 - 🤖 Automatically uploads new images to a specified Discord channel
-- 🔄 Recursive directory watching (monitors all subdirectories)
-- 🛡️ Duplicate prevention with cooldown system
+- 🔄 Recursive folder monitoring (checks all subdirectories)
+- 💾 SQLite state management for tracking processed files (survives restarts)
 - 📊 File size validation (respects Discord's 8MB limit)
 - 🌐 Built-in HTTP server with health check endpoints
 - 📝 Structured JSON logging with zerolog
 - ✅ Graceful shutdown handling
-- 🐳 Docker support with multi-stage builds
+- 🐳 Docker support with multi-stage builds and persistent storage
 - 🛠️ Task automation with Taskfile
 
 ## Setup
@@ -36,20 +36,34 @@ A Golang Discord bot that watches a folder for new images and automatically uplo
 2. Right-click on the channel where you want images posted
 3. Click "Copy Channel ID"
 
-### 3. Configure the Bot
+### 3. Create a Dropbox App
+
+1. Go to [Dropbox App Console](https://www.dropbox.com/developers/apps)
+2. Click "Create app"
+3. Choose "Scoped access"
+4. Choose "Full Dropbox" or "App folder" access
+5. Give it a name
+6. Go to the "Permissions" tab and enable:
+   - `files.metadata.read`
+   - `files.content.read`
+7. Go to the "Settings" tab and generate an access token
+
+### 4. Configure the Bot
 
 Set the following environment variables:
 
 ```bash
 export DISCORD_BOT_TOKEN="your-bot-token-here"
 export DISCORD_CHANNEL_ID="your-channel-id-here"
-export WATCH_DIR="$HOME/Dropbox/Photos/gallery-dl"  # Optional, defaults to this path
+export DROPBOX_ACCESS_TOKEN="your-dropbox-token-here"
+export DROPBOX_FOLDER="/Photos/gallery-dl"  # Optional, defaults to this path
+export POLL_INTERVAL="5m"  # Optional, defaults to 5 minutes
 export PORT="8080"  # Optional, defaults to 8080
 ```
 
 Or create a `.env` file (see `.env.example`)
 
-### 4. Run the Bot
+### 5. Run the Bot
 
 #### Using Task (recommended)
 
@@ -86,8 +100,12 @@ go run main.go
 # Build Docker image
 docker build -t artgrabber .
 
-# Run with environment file
-docker run --rm --env-file .env -p 8080:8080 artgrabber
+# Run with environment file and persistent storage
+docker run --rm \
+  --env-file .env \
+  -v artgrabber-data:/data \
+  -p 8080:8080 \
+  artgrabber
 
 # Or with Task
 task docker:build
@@ -98,11 +116,12 @@ task docker:run
 
 Once the bot is running:
 
-1. It will automatically watch the configured directory and all subdirectories
-2. When a new image file is created or modified, it will be uploaded to Discord
-3. The bot will log all activity to the console in JSON format
-4. The HTTP server will be available for health checks
-5. Press Ctrl+C to gracefully stop the bot
+1. It will poll the configured Dropbox folder and all subdirectories at the specified interval
+2. When a new image file is detected, it will be downloaded and uploaded to Discord
+3. The bot tracks processed files in a SQLite database (stored in `/data/artgrabber.db`)
+4. The bot will log all activity to the console in JSON format
+5. The HTTP server will be available for health checks
+6. Press Ctrl+C to gracefully stop the bot
 
 ## Configuration
 
@@ -110,7 +129,9 @@ Once the bot is running:
 |---------------------|----------|---------|-------------|
 | `DISCORD_BOT_TOKEN` | Yes | - | Your Discord bot token |
 | `DISCORD_CHANNEL_ID` | Yes | - | The Discord channel ID to upload images to |
-| `WATCH_DIR` | No | `~/Dropbox/Photos/gallery-dl` | The directory to watch for new images |
+| `DROPBOX_ACCESS_TOKEN` | Yes | - | Your Dropbox API access token |
+| `DROPBOX_FOLDER` | No | `/Photos/gallery-dl` | The Dropbox folder to monitor for new images |
+| `POLL_INTERVAL` | No | `5m` | How often to check for new files (e.g., "30s", "5m", "1h") |
 | `PORT` | No | `8080` | HTTP server port for health checks |
 
 ## HTTP Endpoints
@@ -122,14 +143,16 @@ The bot includes a built-in HTTP server for monitoring:
 
 ## How It Works
 
-1. The bot starts and recursively adds all directories under `WATCH_DIR` to the file watcher
-2. When a new directory is created, it's automatically added to the watch list
-3. When a new image file is created or modified, the bot:
-   - Waits 500ms to ensure the file is fully written
-   - Checks if it's an image file (by extension)
-   - Verifies the file size is under 8MB
-   - Uploads it to the configured Discord channel
-   - Tracks the upload to prevent duplicates (5-second cooldown)
+1. The bot starts and initializes a SQLite database in `/data/artgrabber.db` to track processed files
+2. Every `POLL_INTERVAL` (default: 5 minutes), the bot:
+   - Queries the Dropbox API to list all files in the configured folder recursively
+   - Checks each file against the database to see if it's been processed
+   - For new image files:
+     - Verifies the file size is under 8MB
+     - Downloads the file from Dropbox
+     - Uploads it to the configured Discord channel
+     - Records the file in the database (path, size, modification time)
+3. If the container restarts, the database persists (when using Docker volumes) so previously uploaded files won't be re-uploaded
 
 ## Supported Image Formats
 
@@ -180,22 +203,27 @@ The project includes a multi-stage Dockerfile for optimal image size:
 # Build the image
 docker build -t artgrabber:dev .
 
-# Run with volume mount for development
+# Run with volume mount for persistent database
 docker run --rm \
   -e DISCORD_BOT_TOKEN=your_token \
   -e DISCORD_CHANNEL_ID=your_channel \
-  -e WATCH_DIR=/watch \
-  -v ~/Dropbox/Photos/gallery-dl:/watch \
+  -e DROPBOX_ACCESS_TOKEN=your_dropbox_token \
+  -e DROPBOX_FOLDER=/Photos/gallery-dl \
+  -e POLL_INTERVAL=5m \
+  -v artgrabber-data:/data \
   -p 8080:8080 \
   artgrabber:dev
 ```
+
+**Important**: The `/data` volume mount is required for the SQLite database to persist across container restarts.
 
 ## Troubleshooting
 
 **Bot doesn't upload images:**
 - Verify the bot has proper permissions in Discord (Send Messages, Attach Files)
 - Check that the channel ID is correct
-- Ensure the watch directory exists and is accessible
+- Ensure the Dropbox access token is valid and has the required permissions
+- Verify the Dropbox folder path is correct (case-sensitive)
 
 **"File size exceeds Discord limit" error:**
 - Discord has an 8MB file size limit for regular users
@@ -203,8 +231,13 @@ docker run --rm \
 
 **Bot crashes on startup:**
 - Verify your Discord token is valid
-- Check that the watch directory exists
-- Ensure you have read permissions on the directory
+- Ensure your Dropbox access token is valid
+- Check that the Dropbox folder path exists
+- Verify `/data` directory is writable (for SQLite database)
+
+**Images are uploaded multiple times:**
+- Ensure the `/data` volume is properly mounted and persisting between restarts
+- Check that the database file `/data/artgrabber.db` exists and is not corrupted
 
 ## License
 
