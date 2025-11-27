@@ -414,8 +414,16 @@ func downloadAndUpload(ctx context.Context, dbxClient files.Client, dg *discordg
 	// Create a reader from the data
 	reader := strings.NewReader(string(data))
 
-	// Send the file to Discord
-	_, err = dg.ChannelFileSend(channelID, metadata.Name, reader)
+	// Send the file to Discord with the file path in the message
+	_, err = dg.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Content: metadata.PathDisplay,
+		Files: []*discordgo.File{
+			{
+				Name:   metadata.Name,
+				Reader: reader,
+			},
+		},
+	})
 	if err != nil {
 		return fmt.Errorf("failed to send file to Discord: %w", err)
 	}
