@@ -393,7 +393,17 @@ func downloadAndUpload(ctx context.Context, dbxClient files.Client, dg *discordg
 		return fmt.Errorf("file size (%d bytes) exceeds Discord limit (8MB)", metadata.Size)
 	}
 
-	// Download file from Dropbox
+	// Create cache directory if it doesn't exist
+	cacheDir := filepath.Join(dataDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0750); err != nil {
+		return fmt.Errorf("failed to create cache directory: %w", err)
+	}
+
+	// Create a temporary file in the cache directory
+	// Use a unique name based on the file path hash to avoid collisions
+	cacheFile := filepath.Join(cacheDir, filepath.Base(metadata.PathLower))
+
+	// Download file from Dropbox to cache
 	downloadArg := files.NewDownloadArg(metadata.PathLower)
 	_, content, err := dbxClient.Download(downloadArg)
 	if err != nil {
@@ -405,14 +415,40 @@ func downloadAndUpload(ctx context.Context, dbxClient files.Client, dg *discordg
 		}
 	}()
 
-	// Read file content into memory
-	data, err := io.ReadAll(content)
+	// Write to cache file
+	outFile, err := os.Create(cacheFile)
 	if err != nil {
-		return fmt.Errorf("failed to read file content: %w", err)
+		return fmt.Errorf("failed to create cache file: %w", err)
+	}
+	defer func() {
+		if closeErr := outFile.Close(); closeErr != nil {
+			log.Error().Err(closeErr).Msg("Error closing cache file")
+		}
+		// Clean up cache file after upload attempt
+		if removeErr := os.Remove(cacheFile); removeErr != nil {
+			log.Error().Err(removeErr).Str("file", cacheFile).Msg("Error removing cache file")
+		}
+	}()
+
+	if _, err := io.Copy(outFile, content); err != nil {
+		return fmt.Errorf("failed to write to cache file: %w", err)
 	}
 
-	// Create a reader from the data
-	reader := strings.NewReader(string(data))
+	// Close the file before reopening for reading
+	if err := outFile.Close(); err != nil {
+		return fmt.Errorf("failed to close cache file after writing: %w", err)
+	}
+
+	// Open the cached file for reading
+	cachedFile, err := os.Open(cacheFile)
+	if err != nil {
+		return fmt.Errorf("failed to open cached file: %w", err)
+	}
+	defer func() {
+		if closeErr := cachedFile.Close(); closeErr != nil {
+			log.Error().Err(closeErr).Msg("Error closing cached file")
+		}
+	}()
 
 	// Send the file to Discord with the file path in the message
 	_, err = dg.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
@@ -420,7 +456,7 @@ func downloadAndUpload(ctx context.Context, dbxClient files.Client, dg *discordg
 		Files: []*discordgo.File{
 			{
 				Name:   metadata.Name,
-				Reader: reader,
+				Reader: cachedFile,
 			},
 		},
 	})
