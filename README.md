@@ -13,6 +13,8 @@ A Golang Discord bot that watches a folder for new images and automatically uplo
 - 🌐 Built-in HTTP server with health check endpoints
 - 📝 Structured JSON logging with zerolog
 - ✅ Graceful shutdown handling
+- 🐳 Docker support with multi-stage builds
+- 🛠️ Task automation with Taskfile
 
 ## Setup
 
@@ -49,6 +51,26 @@ Or create a `.env` file (see `.env.example`)
 
 ### 4. Run the Bot
 
+#### Using Task (recommended)
+
+```bash
+# Install task (if not already installed)
+# macOS: brew install go-task/tap/go-task
+# Linux: sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
+
+# Build and run
+task build
+./artgrabber
+
+# Or run directly
+task run
+
+# See all available tasks
+task --list
+```
+
+#### Using Go directly
+
 ```bash
 # Build and run
 go build -o artgrabber
@@ -56,6 +78,20 @@ go build -o artgrabber
 
 # Or run directly
 go run main.go
+```
+
+#### Using Docker
+
+```bash
+# Build Docker image
+docker build -t artgrabber .
+
+# Run with environment file
+docker run --rm --env-file .env -p 8080:8080 artgrabber
+
+# Or with Task
+task docker:build
+task docker:run
 ```
 
 ## Usage
@@ -102,6 +138,57 @@ The bot includes a built-in HTTP server for monitoring:
 - GIF (.gif)
 - WebP (.webp)
 - BMP (.bmp)
+
+## Development
+
+This project uses [Task](https://taskfile.dev) for task automation. Available tasks:
+
+```bash
+# Build the binary
+task build
+
+# Run the bot
+task run
+
+# Run tests
+task test
+
+# Run linters and formatters
+task lint
+
+# Tidy go modules
+task tidy
+
+# Build Docker image
+task docker:build
+
+# Run Docker container
+task docker:run
+
+# Build for multiple platforms
+task build-all
+
+# Clean build artifacts
+task clean
+```
+
+### Docker Development
+
+The project includes a multi-stage Dockerfile for optimal image size:
+
+```bash
+# Build the image
+docker build -t artgrabber:dev .
+
+# Run with volume mount for development
+docker run --rm \
+  -e DISCORD_BOT_TOKEN=your_token \
+  -e DISCORD_CHANNEL_ID=your_channel \
+  -e WATCH_DIR=/watch \
+  -v ~/Dropbox/Photos/gallery-dl:/watch \
+  -p 8080:8080 \
+  artgrabber:dev
+```
 
 ## Troubleshooting
 
