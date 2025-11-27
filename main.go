@@ -54,7 +54,7 @@ func main() {
 
 // ready is called when the bot is connected to Discord
 func ready(s *discordgo.Session, event *discordgo.Ready) {
-	log.Printf("Bot is ready! Logged in as: %v#%v", event.User.Username, event.User.Discriminator)
+	log.Printf("Bot is ready! Logged in as: %v", event.User.Username)
 	// Set the playing status
 	s.UpdateGameStatus(0, "Art Grabber | !help")
 }
