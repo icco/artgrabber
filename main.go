@@ -68,7 +68,10 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 	// Respond to !ping command
 	if m.Content == "!ping" {
-		s.ChannelMessageSend(m.ChannelID, "Pong!")
+		_, err := s.ChannelMessageSend(m.ChannelID, "Pong!")
+		if err != nil {
+			log.Printf("Error sending message: %v", err)
+		}
 	}
 
 	// Respond to !help command
@@ -78,6 +81,9 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 !help - Display this help message
 
 This bot is designed to grab and share art content.`
-		s.ChannelMessageSend(m.ChannelID, helpMessage)
+		_, err := s.ChannelMessageSend(m.ChannelID, helpMessage)
+		if err != nil {
+			log.Printf("Error sending message: %v", err)
+		}
 	}
 }
