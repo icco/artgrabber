@@ -39,7 +39,7 @@ A Golang Discord bot that watches a folder for new images and automatically uplo
 Set the following environment variables:
 
 ```bash
-export DISCORD_TOKEN="your-bot-token-here"
+export DISCORD_BOT_TOKEN="your-bot-token-here"
 export DISCORD_CHANNEL_ID="your-channel-id-here"
 export WATCH_DIR="$HOME/Dropbox/Photos/gallery-dl"  # Optional, defaults to this path
 export PORT="8080"  # Optional, defaults to 8080
@@ -72,7 +72,7 @@ Once the bot is running:
 
 | Environment Variable | Required | Default | Description |
 |---------------------|----------|---------|-------------|
-| `DISCORD_TOKEN` | Yes | - | Your Discord bot token |
+| `DISCORD_BOT_TOKEN` | Yes | - | Your Discord bot token |
 | `DISCORD_CHANNEL_ID` | Yes | - | The Discord channel ID to upload images to |
 | `WATCH_DIR` | No | `~/Dropbox/Photos/gallery-dl` | The directory to watch for new images |
 | `PORT` | No | `8080` | HTTP server port for health checks |

@@ -32,13 +32,13 @@ func main() {
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
 
 	// Load configuration from environment variables
-	token = os.Getenv("DISCORD_TOKEN")
+	token = os.Getenv("DISCORD_BOT_TOKEN")
 	channelID = os.Getenv("DISCORD_CHANNEL_ID")
 	watchDir = os.Getenv("WATCH_DIR")
 	port = os.Getenv("PORT")
 
 	if token == "" {
-		log.Fatal().Msg("DISCORD_TOKEN environment variable is required")
+		log.Fatal().Msg("DISCORD_BOT_TOKEN environment variable is required")
 	}
 	if channelID == "" {
 		log.Fatal().Msg("DISCORD_CHANNEL_ID environment variable is required")
