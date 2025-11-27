@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,6 +33,11 @@ var (
 	port           string
 	dataDir        string
 	db             *sql.DB
+
+	// Rate limiting: maximum one upload per minute
+	lastUploadTime time.Time
+	uploadMutex    sync.Mutex
+	uploadRateLimit = time.Minute
 )
 
 func main() {
@@ -287,6 +293,20 @@ func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient f
 			continue
 		}
 
+		// Check rate limit before processing
+		uploadMutex.Lock()
+		timeSinceLastUpload := time.Since(lastUploadTime)
+		if timeSinceLastUpload < uploadRateLimit {
+			uploadMutex.Unlock()
+			waitTime := uploadRateLimit - timeSinceLastUpload
+			log.Debug().
+				Str("path", fileMetadata.PathDisplay).
+				Dur("wait_time", waitTime).
+				Msg("Rate limit: skipping file, will retry on next poll")
+			continue
+		}
+		uploadMutex.Unlock()
+
 		log.Info().
 			Str("path", fileMetadata.PathDisplay).
 			Str("name", fileMetadata.Name).
@@ -307,6 +327,15 @@ func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient f
 					Str("path", fileMetadata.PathDisplay).
 					Msg("Failed to mark file as processed")
 			}
+
+			// Update last upload time after successful upload
+			uploadMutex.Lock()
+			lastUploadTime = time.Now()
+			uploadMutex.Unlock()
+
+			log.Info().
+				Str("filename", fileMetadata.Name).
+				Msg("Rate limit: upload complete, will wait 1 minute before next upload")
 		}
 	}
 }
