@@ -22,18 +22,23 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"golang.org/x/oauth2"
 	_ "modernc.org/sqlite"
 )
 
 var (
-	discordToken  string
-	channelID     string
-	dropboxToken  string
-	dropboxFolder string
-	pollInterval  time.Duration
-	port          string
-	dataDir       string
-	db            *sql.DB
+	discordToken        string
+	channelID           string
+	dropboxToken        string
+	dropboxAppKey       string
+	dropboxAppSecret    string
+	dropboxRefreshToken string
+	dropboxFolder       string
+	pollInterval        time.Duration
+	port                string
+	dataDir             string
+	db                  *sql.DB
+	dropboxTokenSource  oauth2.TokenSource // For auto-refreshing tokens
 
 	// Rate limiting: maximum one upload per minute
 	lastUploadTime  time.Time
@@ -50,6 +55,9 @@ func main() {
 	discordToken = os.Getenv("DISCORD_BOT_TOKEN")
 	channelID = os.Getenv("DISCORD_CHANNEL_ID")
 	dropboxToken = os.Getenv("DROPBOX_ACCESS_TOKEN")
+	dropboxAppKey = os.Getenv("DROPBOX_APP_KEY")
+	dropboxAppSecret = os.Getenv("DROPBOX_APP_SECRET")
+	dropboxRefreshToken = os.Getenv("DROPBOX_REFRESH_TOKEN")
 	dropboxFolder = os.Getenv("DROPBOX_FOLDER")
 	dataDir = os.Getenv("DATA_DIR")
 	port = os.Getenv("PORT")
@@ -61,8 +69,21 @@ func main() {
 	if channelID == "" {
 		log.Fatal().Msg("DISCORD_CHANNEL_ID environment variable is required")
 	}
-	if dropboxToken == "" {
-		log.Fatal().Msg("DROPBOX_ACCESS_TOKEN environment variable is required")
+
+	// Validate Dropbox authentication: either access token OR refresh token credentials
+	hasAccessToken := dropboxToken != ""
+	hasRefreshToken := dropboxAppKey != "" && dropboxAppSecret != "" && dropboxRefreshToken != ""
+
+	if !hasAccessToken && !hasRefreshToken {
+		log.Fatal().Msg("Dropbox authentication required: either DROPBOX_ACCESS_TOKEN or (DROPBOX_APP_KEY + DROPBOX_APP_SECRET + DROPBOX_REFRESH_TOKEN)")
+	}
+
+	if hasRefreshToken {
+		log.Info().Msg("Using Dropbox OAuth2 refresh token authentication")
+		// Initialize token source for automatic refresh
+		initDropboxTokenSource()
+	} else {
+		log.Warn().Msg("Using static Dropbox access token (will expire eventually). Consider switching to refresh token authentication.")
 	}
 	if dropboxFolder == "" {
 		dropboxFolder = "/Photos/gallery-dl"
@@ -122,18 +143,12 @@ func main() {
 
 	log.Info().Msg("Bot is now running. Polling Dropbox for new files...")
 
-	// Create Dropbox client
-	config := dropbox.Config{
-		Token: dropboxToken,
-	}
-	dbxClient := files.New(config)
-
 	// Context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start polling Dropbox for new files
-	go pollDropbox(ctx, dbxClient, dg)
+	// Start polling Dropbox for new files (client is created on each poll cycle)
+	go pollDropbox(ctx, dg)
 
 	// Setup Chi web server
 	r := chi.NewRouter()
@@ -189,6 +204,65 @@ func main() {
 	log.Info().Msg("Shutdown complete")
 }
 
+// initDropboxTokenSource initializes the OAuth2 token source for automatic token refresh
+func initDropboxTokenSource() {
+	// Create OAuth2 config
+	oauth2Config := &oauth2.Config{
+		ClientID:     dropboxAppKey,
+		ClientSecret: dropboxAppSecret,
+		Endpoint:     dropbox.OAuthEndpoint(""),
+	}
+
+	// Create token from refresh token
+	tok := &oauth2.Token{
+		RefreshToken: dropboxRefreshToken,
+	}
+
+	// Create token source that will automatically refresh the token
+	dropboxTokenSource = oauth2Config.TokenSource(context.Background(), tok)
+
+	// Test that we can get a token
+	_, err := dropboxTokenSource.Token()
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to get access token from refresh token")
+	}
+
+	log.Info().Msg("Successfully initialized Dropbox OAuth2 token source")
+}
+
+// createDropboxClient creates a Dropbox client with the appropriate authentication method
+func createDropboxClient() files.Client {
+	var token string
+
+	// Check if we're using refresh token authentication
+	if dropboxTokenSource != nil {
+		// Get the current access token (this will automatically refresh if needed)
+		currentToken, err := dropboxTokenSource.Token()
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to get access token from token source")
+			// Fall back to static token if available
+			if dropboxToken != "" {
+				token = dropboxToken
+				log.Warn().Msg("Falling back to static access token")
+			} else {
+				log.Fatal().Msg("Cannot get access token and no fallback available")
+			}
+		} else {
+			token = currentToken.AccessToken
+		}
+	} else {
+		// Use static access token
+		token = dropboxToken
+	}
+
+	// Create Dropbox config and client
+	config := dropbox.Config{
+		Token: token,
+	}
+
+	return files.New(config)
+}
+
 // initDB initializes the SQLite database
 func initDB() (*sql.DB, error) {
 	// Ensure data directory exists
@@ -226,11 +300,12 @@ func initDB() (*sql.DB, error) {
 }
 
 // pollDropbox continuously polls Dropbox for new files
-func pollDropbox(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
+func pollDropbox(ctx context.Context, dg *discordgo.Session) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
 	// Run immediately on start
+	dbxClient := createDropboxClient()
 	scanDropboxFolder(ctx, dbxClient, dg)
 
 	for {
@@ -239,6 +314,8 @@ func pollDropbox(ctx context.Context, dbxClient files.Client, dg *discordgo.Sess
 			log.Info().Msg("Stopping Dropbox polling")
 			return
 		case <-ticker.C:
+			// Recreate client on each poll to ensure fresh token
+			dbxClient = createDropboxClient()
 			scanDropboxFolder(ctx, dbxClient, dg)
 		}
 	}
