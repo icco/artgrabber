@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,18 +26,18 @@ import (
 )
 
 var (
-	discordToken   string
-	channelID      string
-	dropboxToken   string
-	dropboxFolder  string
-	pollInterval   time.Duration
-	port           string
-	dataDir        string
-	db             *sql.DB
+	discordToken  string
+	channelID     string
+	dropboxToken  string
+	dropboxFolder string
+	pollInterval  time.Duration
+	port          string
+	dataDir       string
+	db            *sql.DB
 
 	// Rate limiting: maximum one upload per minute
-	lastUploadTime time.Time
-	uploadMutex    sync.Mutex
+	lastUploadTime  time.Time
+	uploadMutex     sync.Mutex
 	uploadRateLimit = time.Minute
 )
 
@@ -321,11 +322,6 @@ func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient fi
 	timeSinceLastUpload := time.Since(lastUploadTime)
 	if timeSinceLastUpload < uploadRateLimit {
 		uploadMutex.Unlock()
-		waitTime := uploadRateLimit - timeSinceLastUpload
-		log.Debug().
-			Int("batch_size", len(batch)).
-			Dur("wait_time", waitTime).
-			Msg("Rate limit: skipping batch, will retry on next poll")
 		return
 	}
 	uploadMutex.Unlock()
@@ -366,12 +362,7 @@ func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient fi
 func isImageFile(filename string) bool {
 	ext := strings.ToLower(filepath.Ext(filename))
 	imageExtensions := []string{".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-	for _, imgExt := range imageExtensions {
-		if ext == imgExt {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(imageExtensions, ext)
 }
 
 // isFileProcessed checks if a file has already been processed
