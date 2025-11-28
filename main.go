@@ -29,7 +29,6 @@ import (
 var (
 	discordToken        string
 	channelID           string
-	dropboxToken        string
 	dropboxAppKey       string
 	dropboxAppSecret    string
 	dropboxRefreshToken string
@@ -54,7 +53,6 @@ func main() {
 	// Load configuration from environment variables
 	discordToken = os.Getenv("DISCORD_BOT_TOKEN")
 	channelID = os.Getenv("DISCORD_CHANNEL_ID")
-	dropboxToken = os.Getenv("DROPBOX_ACCESS_TOKEN")
 	dropboxAppKey = os.Getenv("DROPBOX_APP_KEY")
 	dropboxAppSecret = os.Getenv("DROPBOX_APP_SECRET")
 	dropboxRefreshToken = os.Getenv("DROPBOX_REFRESH_TOKEN")
@@ -69,22 +67,13 @@ func main() {
 	if channelID == "" {
 		log.Fatal().Msg("DISCORD_CHANNEL_ID environment variable is required")
 	}
-
-	// Validate Dropbox authentication: either access token OR refresh token credentials
-	hasAccessToken := dropboxToken != ""
-	hasRefreshToken := dropboxAppKey != "" && dropboxAppSecret != "" && dropboxRefreshToken != ""
-
-	if !hasAccessToken && !hasRefreshToken {
-		log.Fatal().Msg("Dropbox authentication required: either DROPBOX_ACCESS_TOKEN or (DROPBOX_APP_KEY + DROPBOX_APP_SECRET + DROPBOX_REFRESH_TOKEN)")
+	if dropboxAppKey == "" || dropboxAppSecret == "" || dropboxRefreshToken == "" {
+		log.Fatal().Msg("Dropbox OAuth credentials required: DROPBOX_APP_KEY, DROPBOX_APP_SECRET, and DROPBOX_REFRESH_TOKEN. Run 'go run cmd/oauth-setup/main.go' to set up.")
 	}
 
-	if hasRefreshToken {
-		log.Info().Msg("Using Dropbox OAuth2 refresh token authentication")
-		// Initialize token source for automatic refresh
-		initDropboxTokenSource()
-	} else {
-		log.Warn().Msg("Using static Dropbox access token (will expire eventually). Consider switching to refresh token authentication.")
-	}
+	log.Info().Msg("Using Dropbox OAuth2 refresh token authentication")
+	// Initialize token source for automatic refresh
+	initDropboxTokenSource()
 	if dropboxFolder == "" {
 		dropboxFolder = "/Photos/gallery-dl"
 	}
@@ -230,34 +219,17 @@ func initDropboxTokenSource() {
 	log.Info().Msg("Successfully initialized Dropbox OAuth2 token source")
 }
 
-// createDropboxClient creates a Dropbox client with the appropriate authentication method
+// createDropboxClient creates a Dropbox client using OAuth2 token source
 func createDropboxClient() files.Client {
-	var token string
-
-	// Check if we're using refresh token authentication
-	if dropboxTokenSource != nil {
-		// Get the current access token (this will automatically refresh if needed)
-		currentToken, err := dropboxTokenSource.Token()
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to get access token from token source")
-			// Fall back to static token if available
-			if dropboxToken != "" {
-				token = dropboxToken
-				log.Warn().Msg("Falling back to static access token")
-			} else {
-				log.Fatal().Msg("Cannot get access token and no fallback available")
-			}
-		} else {
-			token = currentToken.AccessToken
-		}
-	} else {
-		// Use static access token
-		token = dropboxToken
+	// Get the current access token (this will automatically refresh if needed)
+	currentToken, err := dropboxTokenSource.Token()
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to get access token from token source")
 	}
 
 	// Create Dropbox config and client
 	config := dropbox.Config{
-		Token: token,
+		Token: currentToken.AccessToken,
 	}
 
 	return files.New(config)

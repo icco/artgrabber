@@ -1,12 +1,13 @@
 # Dropbox OAuth Setup Guide
 
-This guide will help you set up automatic token refresh for your ArtGrabber bot using Dropbox OAuth2.
+This guide will help you set up OAuth2 authentication for your ArtGrabber bot. OAuth2 with refresh tokens is **required** for authentication.
 
-## Why Switch to OAuth?
+## Why OAuth?
 
-- **No more manual token refresh**: Access tokens are automatically refreshed when they expire
+- **Automatic token refresh**: Access tokens are automatically refreshed when they expire
 - **Long-term stability**: The refresh token doesn't expire (or lasts much longer)
-- **Production-ready**: This is the recommended approach for long-running applications
+- **Production-ready**: This is the standard approach for long-running applications
+- **No manual intervention**: Set it up once and forget about it
 
 ## Step 1: Create Dropbox App Credentials
 
@@ -52,15 +53,13 @@ The tool will:
 
 ## Step 4: Update Your Environment Variables
 
-After running the OAuth setup, update your environment variables with the new credentials:
+After running the OAuth setup, set your environment variables with the credentials:
 
 ```bash
 export DROPBOX_APP_KEY="your_app_key"
 export DROPBOX_APP_SECRET="your_app_secret"
 export DROPBOX_REFRESH_TOKEN="your_refresh_token_from_setup"
 ```
-
-You can now **remove** the old `DROPBOX_ACCESS_TOKEN` variable - it's no longer needed!
 
 ## Step 5: Run Your Bot
 
@@ -76,10 +75,6 @@ You should see a log message indicating it's using OAuth2 refresh token authenti
 Using Dropbox OAuth2 refresh token authentication
 Successfully initialized Dropbox OAuth2 token source
 ```
-
-## Backward Compatibility
-
-The bot still supports the old `DROPBOX_ACCESS_TOKEN` method if you want to continue using it. However, you'll see a warning message recommending you switch to refresh tokens.
 
 ## Troubleshooting
 
