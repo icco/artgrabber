@@ -27,6 +27,11 @@ tasks:
     cmds:
       - go run main.go
 
+  oauth:
+    desc: Run OAuth setup tool to get Dropbox credentials
+    cmds:
+      - go run cmd/oauth-setup/main.go
+
   clean:
     desc: Clean build artifacts
     cmds:
