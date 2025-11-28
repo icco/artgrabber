@@ -108,7 +108,8 @@ func main() {
 	}()
 
 	// Generate authorization URL with offline access (for refresh token)
-	authURL := config.AuthCodeURL(state, oauth2.AccessTypeOffline)
+	// Dropbox requires token_access_type=offline to get a refresh token
+	authURL := config.AuthCodeURL(state, oauth2.SetAuthURLParam("token_access_type", "offline"))
 
 	fmt.Println("Please visit this URL to authorize the application:")
 	fmt.Println()
