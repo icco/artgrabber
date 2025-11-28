@@ -1,245 +1,131 @@
 # ArtGrabber
 
-A Golang Discord bot that monitors a Dropbox folder for new images and automatically uploads them to a Discord channel.
+A Discord bot that monitors a Dropbox folder for new images and automatically uploads them to a Discord channel.
 
 ## Features
 
-- ☁️ Monitors Dropbox folder and all subdirectories via Dropbox API
-- 🖼️ Supports common image formats: JPG, PNG, GIF, WebP, BMP
-- 🤖 Automatically uploads new images to a specified Discord channel
-- 🔄 Recursive folder monitoring (checks all subdirectories)
-- 💾 SQLite state management for tracking processed files (survives restarts)
-- 📊 File size validation (respects Discord's 8MB limit)
-- 🌐 Built-in HTTP server with health check endpoints
-- 📝 Structured JSON logging with zerolog
-- ✅ Graceful shutdown handling
-- 🐳 Docker support with multi-stage builds and persistent storage
-- 🛠️ Task automation with Taskfile
+- Monitors Dropbox folder recursively via OAuth2
+- Supports JPG, PNG, GIF, WebP, BMP
+- Automatic token refresh (no manual intervention)
+- SQLite tracking (no duplicate uploads)
+- Health check endpoints
+- Docker support
 
 ## Setup
 
-### 1. Create a Discord Bot
+### 1. Discord Setup
 
-1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
-2. Click "New Application" and give it a name
-3. Go to the "Bot" section and click "Add Bot"
-4. Under "Token", click "Reset Token" and copy the token (you'll need this)
-5. Enable "MESSAGE CONTENT INTENT" under "Privileged Gateway Intents"
-6. Go to "OAuth2" > "URL Generator"
-   - Select scopes: `bot`
-   - Select bot permissions: `Send Messages`, `Attach Files`
-   - Copy the generated URL and open it in your browser to invite the bot to your server
+1. Create a bot at [Discord Developer Portal](https://discord.com/developers/applications)
+2. Copy the bot token
+3. Enable "MESSAGE CONTENT INTENT"
+4. Invite bot with permissions: `Send Messages`, `Attach Files`
+5. Enable Developer Mode in Discord and copy your channel ID
 
-### 2. Get Your Channel ID
+### 2. Dropbox OAuth Setup
 
-1. Enable Developer Mode in Discord (Settings > Advanced > Developer Mode)
-2. Right-click on the channel where you want images posted
-3. Click "Copy Channel ID"
-
-### 3. Create a Dropbox App
-
-1. Go to [Dropbox App Console](https://www.dropbox.com/developers/apps)
-2. Click "Create app"
-3. Choose "Scoped access"
-4. Choose "Full Dropbox" or "App folder" access
-5. Give it a name
-6. Go to the "Permissions" tab and enable:
-   - `files.metadata.read`
-   - `files.content.read`
-7. Go to the "Settings" tab and generate an access token
-
-### 4. Configure the Bot
-
-Set the following environment variables:
+Run the OAuth setup tool to get your credentials:
 
 ```bash
-export DISCORD_BOT_TOKEN="your-bot-token-here"
-export DISCORD_CHANNEL_ID="your-channel-id-here"
-export DROPBOX_ACCESS_TOKEN="your-dropbox-token-here"
-export DROPBOX_FOLDER="/Photos/gallery-dl"  # Optional, defaults to this path
-export DATA_DIR="/data"  # Optional, defaults to /data
-export POLL_INTERVAL="5m"  # Optional, defaults to 5 minutes
-export PORT="8080"  # Optional, defaults to 8080
+go run cmd/oauth-setup/main.go
 ```
 
-Or create a `.env` file (see `.env.example`)
+See [OAUTH_SETUP.md](OAUTH_SETUP.md) for detailed instructions.
 
-### 5. Run the Bot
-
-#### Using Task (recommended)
+### 3. Configure Environment
 
 ```bash
-# Install task (if not already installed)
-# macOS: brew install go-task/tap/go-task
-# Linux: sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
+# Required
+export DISCORD_BOT_TOKEN="your-bot-token"
+export DISCORD_CHANNEL_ID="your-channel-id"
+export DROPBOX_APP_KEY="your-app-key"
+export DROPBOX_APP_SECRET="your-app-secret"
+export DROPBOX_REFRESH_TOKEN="your-refresh-token"
 
-# Build and run
-task build
-./artgrabber
-
-# Or run directly
-task run
-
-# See all available tasks
-task --list
+# Optional
+export DROPBOX_FOLDER="/Photos/gallery-dl"
+export POLL_INTERVAL="5m"
+export PORT="8080"
 ```
 
-#### Using Go directly
+Or use `.env` file (see `.env.example`)
 
+### 4. Run
+
+**Go:**
 ```bash
-# Build and run
 go build -o artgrabber
 ./artgrabber
-
-# Or run directly
-go run main.go
 ```
 
-#### Using Docker
-
+**Docker:**
 ```bash
-# Build Docker image
 docker build -t artgrabber .
-
-# Run with environment file and persistent storage
-docker run --rm \
-  --env-file .env \
-  -v artgrabber-data:/data \
-  -p 8080:8080 \
-  artgrabber
-
-# Or with Task
-task docker:build
-task docker:run
+docker run --rm --env-file .env -v artgrabber-data:/data -p 8080:8080 artgrabber
 ```
 
-## Usage
-
-Once the bot is running:
-
-1. It will poll the configured Dropbox folder and all subdirectories at the specified interval
-2. When a new image file is detected, it will be downloaded and uploaded to Discord
-3. The bot tracks processed files in a SQLite database (stored in `/data/artgrabber.db`)
-4. The bot will log all activity to the console in JSON format
-5. The HTTP server will be available for health checks
-6. Press Ctrl+C to gracefully stop the bot
-
-## Configuration
-
-| Environment Variable | Required | Default | Description |
-|---------------------|----------|---------|-------------|
-| `DISCORD_BOT_TOKEN` | Yes | - | Your Discord bot token |
-| `DISCORD_CHANNEL_ID` | Yes | - | The Discord channel ID to upload images to |
-| `DROPBOX_ACCESS_TOKEN` | Yes | - | Your Dropbox API access token |
-| `DROPBOX_FOLDER` | No | `/Photos/gallery-dl` | The Dropbox folder to monitor for new images |
-| `POLL_INTERVAL` | No | `5m` | How often to check for new files (e.g., "30s", "5m", "1h") |
-| `PORT` | No | `8080` | HTTP server port for health checks |
-
-## HTTP Endpoints
-
-The bot includes a built-in HTTP server for monitoring:
-
-- `GET /health` - Basic health check (always returns 200 if server is running)
-- `GET /ready` - Readiness check (returns 200 if Discord is connected, 503 otherwise)
+**Task:** (see `task --list` for all commands)
+```bash
+task build && ./artgrabber
+```
 
 ## How It Works
 
-1. The bot starts and initializes a SQLite database in `/data/artgrabber.db` to track processed files
-2. Every `POLL_INTERVAL` (default: 5 minutes), the bot:
-   - Queries the Dropbox API to list all files in the configured folder recursively
-   - Checks each file against the database to see if it's been processed
-   - For new image files:
-     - Verifies the file size is under 8MB
-     - Downloads the file from Dropbox
-     - Uploads it to the configured Discord channel
-     - Records the file in the database (path, size, modification time)
-3. If the container restarts, the database persists (when using Docker volumes) so previously uploaded files won't be re-uploaded
+1. Bot polls Dropbox folder every `POLL_INTERVAL` (default: 5 minutes)
+2. New images are downloaded and uploaded to Discord
+3. SQLite database tracks processed files to prevent duplicates
+4. Access tokens refresh automatically via OAuth2
 
-## Supported Image Formats
+## Configuration
 
-- JPEG (.jpg, .jpeg)
-- PNG (.png)
-- GIF (.gif)
-- WebP (.webp)
-- BMP (.bmp)
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DISCORD_BOT_TOKEN` | Yes | - | Discord bot token |
+| `DISCORD_CHANNEL_ID` | Yes | - | Target Discord channel |
+| `DROPBOX_APP_KEY` | Yes | - | Dropbox app key |
+| `DROPBOX_APP_SECRET` | Yes | - | Dropbox app secret |
+| `DROPBOX_REFRESH_TOKEN` | Yes | - | OAuth refresh token |
+| `DROPBOX_FOLDER` | No | `/Photos/gallery-dl` | Folder to monitor |
+| `POLL_INTERVAL` | No | `5m` | Check interval |
+| `PORT` | No | `8080` | HTTP server port |
+
+## Endpoints
+
+- `GET /` - Status page with last upload info
+- `GET /health` - Health check
+- `GET /ready` - Readiness check (Discord connection)
 
 ## Development
 
-This project uses [Task](https://taskfile.dev) for task automation. Available tasks:
+Uses [Task](https://taskfile.dev) for automation. Run `task --list` to see all commands.
 
+Common tasks:
 ```bash
-# Build the binary
-task build
-
-# Run the bot
-task run
-
-# Run tests
-task test
-
-# Run linters and formatters
-task lint
-
-# Tidy go modules
-task tidy
-
-# Build Docker image
-task docker:build
-
-# Run Docker container
-task docker:run
-
-# Build for multiple platforms
-task build-all
-
-# Clean build artifacts
-task clean
+task build      # Build binary
+task run        # Run bot
+task lint       # Lint and format
+task test       # Run tests
 ```
-
-### Docker Development
-
-The project includes a multi-stage Dockerfile for optimal image size:
-
-```bash
-# Build the image
-docker build -t artgrabber:dev .
-
-# Run with volume mount for persistent database
-docker run --rm \
-  -e DISCORD_BOT_TOKEN=your_token \
-  -e DISCORD_CHANNEL_ID=your_channel \
-  -e DROPBOX_ACCESS_TOKEN=your_dropbox_token \
-  -e DROPBOX_FOLDER=/Photos/gallery-dl \
-  -e POLL_INTERVAL=5m \
-  -v artgrabber-data:/data \
-  -p 8080:8080 \
-  artgrabber:dev
-```
-
-**Important**: The `/data` volume mount is required for the SQLite database to persist across container restarts.
 
 ## Troubleshooting
 
-**Bot doesn't upload images:**
-- Verify the bot has proper permissions in Discord (Send Messages, Attach Files)
-- Check that the channel ID is correct
-- Ensure the Dropbox access token is valid and has the required permissions
-- Verify the Dropbox folder path is correct (case-sensitive)
+**Images not uploading:**
+- Check Discord bot permissions (Send Messages, Attach Files)
+- Verify channel ID is correct
+- Confirm Dropbox OAuth credentials are valid
+- Check folder path (case-sensitive)
 
-**"File size exceeds Discord limit" error:**
-- Discord has an 8MB file size limit for regular users
-- Consider compressing images or upgrading to Discord Nitro for 50MB limit
+**Token expired errors:**
+- Run `go run cmd/oauth-setup/main.go` to get fresh credentials
+- Verify all three OAuth variables are set (APP_KEY, APP_SECRET, REFRESH_TOKEN)
 
-**Bot crashes on startup:**
-- Verify your Discord token is valid
-- Ensure your Dropbox access token is valid
-- Check that the Dropbox folder path exists
-- Verify `/data` directory is writable (for SQLite database)
+**Duplicate uploads:**
+- Ensure `/data` volume persists between restarts
+- Check `/data/artgrabber.db` exists and is not corrupted
 
-**Images are uploaded multiple times:**
-- Ensure the `/data` volume is properly mounted and persisting between restarts
-- Check that the database file `/data/artgrabber.db` exists and is not corrupted
+**Files too large:**
+- Discord limit: 8MB (50MB with Nitro)
+- Bot automatically skips files over limit
 
 ## License
 
-See LICENSE file for details.
+MIT - See LICENSE file.
