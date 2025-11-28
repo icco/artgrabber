@@ -456,6 +456,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		}
 
 		// Write to cache file
+		// #nosec G304 -- cacheFile is safely constructed using filepath.Join with filepath.Base, preventing directory traversal
 		outFile, err := os.Create(cacheFile)
 		if err != nil {
 			if closeErr := content.Close(); closeErr != nil {
@@ -490,6 +491,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		}
 
 		// Open the cached file for reading
+		// #nosec G304 -- cacheFile is safely constructed using filepath.Join with filepath.Base, preventing directory traversal
 		cachedFile, err := os.Open(cacheFile)
 		if err != nil {
 			log.Error().
