@@ -27,6 +27,11 @@ tasks:
     cmds:
       - go run main.go
 
+  oauth:
+    desc: Run OAuth setup tool to get Dropbox credentials
+    cmds:
+      - go run cmd/oauth-setup/main.go
+
   clean:
     desc: Clean build artifacts
     cmds:
@@ -48,21 +53,6 @@ tasks:
     desc: Tidy go modules
     cmds:
       - go mod tidy
-
-  docker:build:
-    desc: Build Docker image
-    cmds:
-      - docker build -t {{.DOCKER_IMAGE}}:{{.DOCKER_TAG}} .
-
-  docker:run:
-    desc: Run Docker container with persistent storage
-    cmds:
-      - docker run --rm --env-file .env -v artgrabber-data:/data -p 8080:8080 {{.DOCKER_IMAGE}}:{{.DOCKER_TAG}}
-
-  docker:push:
-    desc: Push Docker image to registry
-    cmds:
-      - docker push {{.DOCKER_IMAGE}}:{{.DOCKER_TAG}}
 
   build-all:
     desc: Build for multiple platforms
