@@ -71,7 +71,9 @@ func main() {
 		// Verify state parameter
 		if r.URL.Query().Get("state") != state {
 			errorChan <- fmt.Errorf("invalid state parameter")
-			fmt.Fprintf(w, "Error: Invalid state parameter")
+			if _, err := fmt.Fprintf(w, "Error: Invalid state parameter"); err != nil {
+				fmt.Printf("Failed to write error response: %v\n", err)
+			}
 			return
 		}
 
@@ -83,7 +85,9 @@ func main() {
 				errorMsg = "unknown error"
 			}
 			errorChan <- fmt.Errorf("authorization failed: %s", errorMsg)
-			fmt.Fprintf(w, "Error: Authorization failed - %s", errorMsg)
+			if _, err := fmt.Fprintf(w, "Error: Authorization failed - %s", errorMsg); err != nil {
+				fmt.Printf("Failed to write error response: %v\n", err)
+			}
 			return
 		}
 
@@ -91,14 +95,16 @@ func main() {
 		codeChan <- code
 
 		// Show success page
-		fmt.Fprintf(w, `<!DOCTYPE html>
+		if _, err := fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
 <head><title>OAuth Success</title></head>
 <body>
 <h1>✅ Authorization Successful!</h1>
 <p>You can close this window and return to your terminal.</p>
 </body>
-</html>`)
+</html>`); err != nil {
+			fmt.Printf("Failed to write success response: %v\n", err)
+		}
 	})
 
 	go func() {
