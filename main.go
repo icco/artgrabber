@@ -33,6 +33,7 @@ var (
 	dropboxAppSecret    string
 	dropboxRefreshToken string
 	dropboxFolder       string
+	wallpapersFolder    string
 	pollInterval        time.Duration
 	port                string
 	dataDir             string
@@ -61,6 +62,7 @@ func main() {
 	dropboxAppSecret = os.Getenv("DROPBOX_APP_SECRET")
 	dropboxRefreshToken = os.Getenv("DROPBOX_REFRESH_TOKEN")
 	dropboxFolder = os.Getenv("DROPBOX_FOLDER")
+	wallpapersFolder = os.Getenv("WALLPAPERS_FOLDER")
 	dataDir = os.Getenv("DATA_DIR")
 	port = os.Getenv("PORT")
 	pollIntervalStr := os.Getenv("POLL_INTERVAL")
@@ -81,6 +83,9 @@ func main() {
 	if dropboxFolder == "" {
 		dropboxFolder = "/Photos/gallery-dl"
 	}
+	if wallpapersFolder == "" {
+		wallpapersFolder = "/photos/wallpapers"
+	}
 	if dataDir == "" {
 		dataDir = "/data"
 	}
@@ -99,6 +104,7 @@ func main() {
 
 	log.Info().
 		Str("dropbox_folder", dropboxFolder).
+		Str("wallpapers_folder", wallpapersFolder).
 		Str("channel_id", channelID).
 		Str("data_dir", dataDir).
 		Str("port", port).
@@ -321,7 +327,7 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 		Msg("User voted for file")
 
 	// Copy the file to photos/wallpapers
-	destinationPath := "/photos/wallpapers/" + filepath.Base(selectedPath)
+	destinationPath := wallpapersFolder + "/" + filepath.Base(selectedPath)
 
 	// Create Dropbox client
 	dbxClient := createDropboxClient()
