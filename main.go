@@ -46,8 +46,10 @@ var (
 	uploadRateLimit = time.Minute
 
 	// Message tracking for voting
-	messageFilesMutex sync.RWMutex
-	messageFiles      = make(map[string][]string) // messageID -> list of file paths
+	messageFilesMutex  sync.RWMutex
+	messageFiles       = make(map[string][]string)  // messageID -> list of file paths
+	messageTimestamps  = make(map[string]time.Time) // messageID -> timestamp
+	messageTrackingTTL = 24 * time.Hour             // Keep message tracking for 24 hours
 )
 
 func main() {
@@ -151,6 +153,9 @@ func main() {
 
 	// Start polling Dropbox for new files (client is created on each poll cycle)
 	go pollDropbox(ctx, dg)
+
+	// Start cleanup routine for message tracking
+	go cleanupOldMessageTracking(ctx)
 
 	// Setup Chi web server
 	r := chi.NewRouter()
@@ -327,7 +332,7 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 		Msg("User voted for file")
 
 	// Copy the file to photos/wallpapers
-	destinationPath := wallpapersFolder + "/" + filepath.Base(selectedPath)
+	destinationPath := filepath.Join(wallpapersFolder, filepath.Base(selectedPath))
 
 	// Create Dropbox client
 	dbxClient := createDropboxClient()
@@ -364,12 +369,44 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 		userName = user.Username
 	}
 
-	confirmMsg := fmt.Sprintf("✅ Copied `%s` to `photos/wallpapers` (voted by %s)",
-		filepath.Base(selectedPath), userName)
+	confirmMsg := fmt.Sprintf("✅ Copied `%s` to `%s` (voted by %s)",
+		filepath.Base(selectedPath), wallpapersFolder, userName)
 
 	_, err = s.ChannelMessageSend(r.ChannelID, confirmMsg)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to send confirmation message")
+	}
+}
+
+// cleanupOldMessageTracking periodically removes old entries from the message tracking maps
+func cleanupOldMessageTracking(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Msg("Stopping message tracking cleanup")
+			return
+		case <-ticker.C:
+			messageFilesMutex.Lock()
+			now := time.Now()
+			var removed int
+			for msgID, timestamp := range messageTimestamps {
+				if now.Sub(timestamp) > messageTrackingTTL {
+					delete(messageFiles, msgID)
+					delete(messageTimestamps, msgID)
+					removed++
+				}
+			}
+			messageFilesMutex.Unlock()
+
+			if removed > 0 {
+				log.Info().
+					Int("removed_count", removed).
+					Msg("Cleaned up old message tracking entries")
+			}
+		}
 	}
 }
 
@@ -699,6 +736,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 	// Store the message ID with the file paths for voting
 	messageFilesMutex.Lock()
 	messageFiles[msg.ID] = paths
+	messageTimestamps[msg.ID] = time.Now()
 	messageFilesMutex.Unlock()
 
 	// Add number reactions to the message for voting (only up to 5 files)
