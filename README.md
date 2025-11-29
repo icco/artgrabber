@@ -44,7 +44,7 @@ export DROPBOX_REFRESH_TOKEN="your-refresh-token"
 
 # Optional
 export DROPBOX_FOLDER="/Photos/gallery-dl"
-export WALLPAPERS_FOLDER="/photos/wallpapers"
+export WALLPAPERS_FOLDER="/Photos/Wallpapers"
 export POLL_INTERVAL="5m"
 export PORT="8080"
 ```
@@ -89,7 +89,7 @@ task build && ./artgrabber
 | `DROPBOX_APP_SECRET` | Yes | - | Dropbox app secret |
 | `DROPBOX_REFRESH_TOKEN` | Yes | - | OAuth refresh token |
 | `DROPBOX_FOLDER` | No | `/Photos/gallery-dl` | Folder to monitor |
-| `WALLPAPERS_FOLDER` | No | `/photos/wallpapers` | Folder for voted images |
+| `WALLPAPERS_FOLDER` | No | `/Photos/Wallpapers` | Folder for voted images |
 | `POLL_INTERVAL` | No | `5m` | Check interval |
 | `PORT` | No | `8080` | HTTP server port |
 
@@ -116,7 +116,7 @@ When the bot posts images to Discord:
 3️⃣ /Photos/gallery-dl/art/image3.jpg
 ```
 
-Click 2️⃣ → Bot copies `image2.jpg` to `/photos/wallpapers/`
+Click 2️⃣ → Bot copies `image2.jpg` to `/Photos/Wallpapers/`
 
 ## Development
 

@@ -46,10 +46,7 @@ var (
 	uploadRateLimit = time.Minute
 
 	// Message tracking for voting
-	messageFilesMutex  sync.RWMutex
-	messageFiles       = make(map[string][]string)  // messageID -> list of file paths
-	messageTimestamps  = make(map[string]time.Time) // messageID -> timestamp
-	messageTrackingTTL = 24 * time.Hour             // Keep message tracking for 24 hours
+	messageTrackingTTL = 24 * time.Hour // Keep message tracking for 24 hours
 
 	// Voting emoji constants
 	numberEmojis = []string{"1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"}
@@ -92,7 +89,7 @@ func main() {
 		dropboxFolder = "/Photos/gallery-dl"
 	}
 	if wallpapersFolder == "" {
-		wallpapersFolder = "/photos/wallpapers"
+		wallpapersFolder = "/Photos/Wallpapers"
 	}
 	if dataDir == "" {
 		dataDir = "/data"
@@ -282,6 +279,15 @@ func initDB() (*sql.DB, error) {
 		uploaded BOOLEAN NOT NULL DEFAULT 1
 	);
 	CREATE INDEX IF NOT EXISTS idx_processed_at ON processed_files(processed_at);
+	
+	CREATE TABLE IF NOT EXISTS message_tracking (
+		message_id TEXT NOT NULL,
+		file_path TEXT NOT NULL,
+		file_index INTEGER NOT NULL,
+		created_at TEXT NOT NULL,
+		PRIMARY KEY (message_id, file_index)
+	);
+	CREATE INDEX IF NOT EXISTS idx_message_created_at ON message_tracking(created_at);
 	`
 
 	if _, err := database.Exec(schema); err != nil {
@@ -307,23 +313,29 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 		return
 	}
 
-	// Get the file paths associated with this message
-	messageFilesMutex.RLock()
-	filePaths, exists := messageFiles[r.MessageID]
-	messageFilesMutex.RUnlock()
-
-	if !exists {
-		// This message doesn't have any associated files (not our message)
-		return
-	}
-
+	// Map emoji to index
 	index, validEmoji := emojiToIndex[r.Emoji.Name]
-	if !validEmoji || index >= len(filePaths) {
-		// Not a valid voting emoji or out of range
+	if !validEmoji {
+		// Not a valid voting emoji
 		return
 	}
 
-	selectedPath := filePaths[index]
+	// Get the file path from database
+	selectedPath, err := getFilePathByMessageAndIndex(r.MessageID, index)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("message_id", r.MessageID).
+			Int("index", index).
+			Msg("Failed to get file path from database")
+		return
+	}
+
+	if selectedPath == "" {
+		// No file found for this message/index (not our message or invalid index)
+		return
+	}
+
 	log.Info().
 		Str("message_id", r.MessageID).
 		Str("user_id", r.UserID).
@@ -332,7 +344,7 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 		Str("file_path", selectedPath).
 		Msg("User voted for file")
 
-	// Copy the file to photos/wallpapers
+	// Copy the file to Photos/Wallpapers
 	destinationPath := filepath.Join(wallpapersFolder, filepath.Base(selectedPath))
 
 	// Create Dropbox client
@@ -391,7 +403,7 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 	}
 }
 
-// cleanupOldMessageTracking periodically removes old entries from the message tracking maps
+// cleanupOldMessageTracking periodically removes old entries from the message tracking database
 func cleanupOldMessageTracking(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
@@ -402,21 +414,25 @@ func cleanupOldMessageTracking(ctx context.Context) {
 			log.Info().Msg("Stopping message tracking cleanup")
 			return
 		case <-ticker.C:
-			messageFilesMutex.Lock()
-			now := time.Now()
-			var removed int
-			for msgID, timestamp := range messageTimestamps {
-				if now.Sub(timestamp) > messageTrackingTTL {
-					delete(messageFiles, msgID)
-					delete(messageTimestamps, msgID)
-					removed++
-				}
+			cutoffTime := time.Now().Add(-messageTrackingTTL).Format(time.RFC3339)
+			result, err := db.Exec(
+				"DELETE FROM message_tracking WHERE created_at < ?",
+				cutoffTime,
+			)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to cleanup old message tracking entries")
+				continue
 			}
-			messageFilesMutex.Unlock()
+
+			removed, err := result.RowsAffected()
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to get rows affected")
+				continue
+			}
 
 			if removed > 0 {
 				log.Info().
-					Int("removed_count", removed).
+					Int64("removed_count", removed).
 					Msg("Cleaned up old message tracking entries")
 			}
 		}
@@ -597,6 +613,54 @@ func markFileProcessed(metadata *files.FileMetadata) error {
 	return err
 }
 
+// storeMessageTracking stores the message ID and associated file paths in the database
+func storeMessageTracking(messageID string, filePaths []string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
+			log.Error().Err(err).Msg("Error rolling back transaction")
+		}
+	}()
+
+	createdAt := time.Now().Format(time.RFC3339)
+	for i, filePath := range filePaths {
+		_, err := tx.Exec(
+			"INSERT INTO message_tracking (message_id, file_path, file_index, created_at) VALUES (?, ?, ?, ?)",
+			messageID, filePath, i, createdAt,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert message tracking: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// getFilePathByMessageAndIndex retrieves the file path for a given message ID and emoji index
+func getFilePathByMessageAndIndex(messageID string, index int) (string, error) {
+	var filePath string
+	err := db.QueryRow(
+		"SELECT file_path FROM message_tracking WHERE message_id = ? AND file_index = ?",
+		messageID, index,
+	).Scan(&filePath)
+
+	if err == sql.ErrNoRows {
+		return "", nil // No file found for this message/index
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to query message tracking: %w", err)
+	}
+
+	return filePath, nil
+}
+
 // downloadAndUploadBatch downloads multiple files from Dropbox and uploads them in a single Discord message
 func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *discordgo.Session, batch []*files.FileMetadata) error {
 	// Create cache directory if it doesn't exist
@@ -745,11 +809,14 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		return fmt.Errorf("failed to send files to Discord: %w", err)
 	}
 
-	// Store the message ID with the file paths for voting
-	messageFilesMutex.Lock()
-	messageFiles[msg.ID] = paths
-	messageTimestamps[msg.ID] = time.Now()
-	messageFilesMutex.Unlock()
+	// Store the message ID with the file paths for voting in database
+	if err := storeMessageTracking(msg.ID, paths); err != nil {
+		log.Error().
+			Err(err).
+			Str("message_id", msg.ID).
+			Msg("Failed to store message tracking in database")
+		// Continue anyway since the files were uploaded
+	}
 
 	// Add number reactions to the message for voting (only up to 5 files)
 	for i := 0; i < len(paths) && i < len(numberEmojis); i++ {
