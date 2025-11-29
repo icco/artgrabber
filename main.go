@@ -50,6 +50,12 @@ var (
 	messageFiles       = make(map[string][]string)  // messageID -> list of file paths
 	messageTimestamps  = make(map[string]time.Time) // messageID -> timestamp
 	messageTrackingTTL = 24 * time.Hour             // Keep message tracking for 24 hours
+
+	// Voting emoji constants
+	numberEmojis = []string{"1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"}
+	emojiToIndex = map[string]int{
+		"1️⃣": 0, "2️⃣": 1, "3️⃣": 2, "4️⃣": 3, "5️⃣": 4,
+	}
 )
 
 func main() {
@@ -311,11 +317,6 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 		return
 	}
 
-	// Map emoji reactions to indices
-	emojiToIndex := map[string]int{
-		"1️⃣": 0, "2️⃣": 1, "3️⃣": 2, "4️⃣": 3, "5️⃣": 4,
-	}
-
 	index, validEmoji := emojiToIndex[r.Emoji.Name]
 	if !validEmoji || index >= len(filePaths) {
 		// Not a valid voting emoji or out of range
@@ -338,8 +339,10 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 	dbxClient := createDropboxClient()
 
 	// Copy the file in Dropbox
+	// Use autorename to avoid conflicts if file already exists
 	copyArg := files.NewRelocationArg(selectedPath, destinationPath)
-	_, err := dbxClient.CopyV2(copyArg)
+	copyArg.Autorename = true
+	copyResult, err := dbxClient.CopyV2(copyArg)
 	if err != nil {
 		log.Error().
 			Err(err).
@@ -347,24 +350,34 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 			Str("destination", destinationPath).
 			Msg("Failed to copy file in Dropbox")
 
-		// Send error message to channel
-		_, sendErr := s.ChannelMessageSend(r.ChannelID,
-			fmt.Sprintf("❌ Failed to copy `%s` to wallpapers folder: %v",
-				filepath.Base(selectedPath), err))
+		// Check if error is due to file already existing
+		errorMsg := fmt.Sprintf("❌ Failed to copy `%s` to wallpapers folder: %v",
+			filepath.Base(selectedPath), err)
+
+		_, sendErr := s.ChannelMessageSend(r.ChannelID, errorMsg)
 		if sendErr != nil {
 			log.Error().Err(sendErr).Msg("Failed to send error message")
 		}
 		return
 	}
 
+	// Get the final path (may be renamed if autorename was triggered)
+	finalPath := destinationPath
+	if copyResult != nil && copyResult.Metadata != nil {
+		if fileMetadata, ok := copyResult.Metadata.(*files.FileMetadata); ok {
+			finalPath = fileMetadata.PathDisplay
+		}
+	}
+
 	log.Info().
 		Str("source", selectedPath).
-		Str("destination", destinationPath).
+		Str("destination", finalPath).
 		Msg("Successfully copied file to wallpapers")
 
 	// Send confirmation message to channel
-	user, err := s.User(r.UserID)
+	// Use UserID as fallback if User() API call fails
 	userName := r.UserID
+	user, err := s.User(r.UserID)
 	if err == nil && user != nil {
 		userName = user.Username
 	}
@@ -713,7 +726,6 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 
 	// Create message content with numbered file paths
 	// Use emoji numbers for voting (1️⃣, 2️⃣, 3️⃣, 4️⃣, 5️⃣)
-	numberEmojis := []string{"1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"}
 	var messageLines []string
 	for i, path := range paths {
 		if i < len(numberEmojis) {
