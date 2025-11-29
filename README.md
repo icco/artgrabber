@@ -30,7 +30,7 @@ Run the OAuth setup tool to get your credentials:
 go run cmd/oauth-setup/main.go
 ```
 
-See [OAUTH_SETUP.md](OAUTH_SETUP.md) for detailed instructions.
+See [OAUTH_SETUP](cmd/oauth-setup/README.md) for detailed instructions.
 
 ### 3. Configure Environment
 
