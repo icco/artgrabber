@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,6 +34,7 @@ var (
 	dropboxAppSecret    string
 	dropboxRefreshToken string
 	dropboxFolder       string
+	wallpapersFolder    string
 	pollInterval        time.Duration
 	port                string
 	dataDir             string
@@ -43,6 +45,15 @@ var (
 	lastUploadTime  time.Time
 	uploadMutex     sync.Mutex
 	uploadRateLimit = time.Minute
+
+	// Message tracking for voting
+	messageTrackingTTL = 24 * time.Hour // Keep message tracking for 24 hours
+
+	// Voting emoji constants
+	numberEmojis = []string{"1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"}
+	emojiToIndex = map[string]int{
+		"1️⃣": 0, "2️⃣": 1, "3️⃣": 2, "4️⃣": 3, "5️⃣": 4,
+	}
 )
 
 func main() {
@@ -57,6 +68,7 @@ func main() {
 	dropboxAppSecret = os.Getenv("DROPBOX_APP_SECRET")
 	dropboxRefreshToken = os.Getenv("DROPBOX_REFRESH_TOKEN")
 	dropboxFolder = os.Getenv("DROPBOX_FOLDER")
+	wallpapersFolder = os.Getenv("WALLPAPERS_FOLDER")
 	dataDir = os.Getenv("DATA_DIR")
 	port = os.Getenv("PORT")
 	pollIntervalStr := os.Getenv("POLL_INTERVAL")
@@ -77,6 +89,9 @@ func main() {
 	if dropboxFolder == "" {
 		dropboxFolder = "/Photos/gallery-dl"
 	}
+	if wallpapersFolder == "" {
+		wallpapersFolder = "/Photos/Wallpapers"
+	}
 	if dataDir == "" {
 		dataDir = "/data"
 	}
@@ -95,6 +110,7 @@ func main() {
 
 	log.Info().
 		Str("dropbox_folder", dropboxFolder).
+		Str("wallpapers_folder", wallpapersFolder).
 		Str("channel_id", channelID).
 		Str("data_dir", dataDir).
 		Str("port", port).
@@ -119,6 +135,9 @@ func main() {
 		log.Fatal().Err(err).Msg("Error creating Discord session")
 	}
 
+	// Add reaction handler for voting
+	dg.AddHandler(messageReactionAddHandler)
+
 	// Open Discord connection
 	err = dg.Open()
 	if err != nil {
@@ -138,6 +157,9 @@ func main() {
 
 	// Start polling Dropbox for new files (client is created on each poll cycle)
 	go pollDropbox(ctx, dg)
+
+	// Start cleanup routine for message tracking
+	go cleanupOldMessageTracking(ctx)
 
 	// Setup Chi web server
 	r := chi.NewRouter()
@@ -258,6 +280,15 @@ func initDB() (*sql.DB, error) {
 		uploaded BOOLEAN NOT NULL DEFAULT 1
 	);
 	CREATE INDEX IF NOT EXISTS idx_processed_at ON processed_files(processed_at);
+	
+	CREATE TABLE IF NOT EXISTS message_tracking (
+		message_id TEXT NOT NULL,
+		file_path TEXT NOT NULL,
+		file_index INTEGER NOT NULL,
+		created_at TEXT NOT NULL,
+		PRIMARY KEY (message_id, file_index)
+	);
+	CREATE INDEX IF NOT EXISTS idx_message_created_at ON message_tracking(created_at);
 	`
 
 	if _, err := database.Exec(schema); err != nil {
@@ -269,6 +300,144 @@ func initDB() (*sql.DB, error) {
 
 	log.Info().Str("db_path", dbPath).Msg("Database initialized")
 	return database, nil
+}
+
+// messageReactionAddHandler handles reactions added to messages for voting
+func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
+	// Ignore reactions from the bot itself
+	if r.UserID == s.State.User.ID {
+		return
+	}
+
+	// Only process reactions in the configured channel
+	if r.ChannelID != channelID {
+		return
+	}
+
+	// Map emoji to index
+	index, validEmoji := emojiToIndex[r.Emoji.Name]
+	if !validEmoji {
+		// Not a valid voting emoji
+		return
+	}
+
+	// Get the file path from database
+	selectedPath, err := getFilePathByMessageAndIndex(r.MessageID, index)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("message_id", r.MessageID).
+			Int("index", index).
+			Msg("Failed to get file path from database")
+		return
+	}
+
+	if selectedPath == "" {
+		// No file found for this message/index (not our message or invalid index)
+		return
+	}
+
+	log.Info().
+		Str("message_id", r.MessageID).
+		Str("user_id", r.UserID).
+		Str("emoji", r.Emoji.Name).
+		Int("index", index).
+		Str("file_path", selectedPath).
+		Msg("User voted for file")
+
+	// Copy the file to Photos/Wallpapers
+	destinationPath := filepath.Join(wallpapersFolder, filepath.Base(selectedPath))
+
+	// Create Dropbox client
+	dbxClient := createDropboxClient()
+
+	// Copy the file in Dropbox
+	// Use autorename to avoid conflicts if file already exists
+	copyArg := files.NewRelocationArg(selectedPath, destinationPath)
+	copyArg.Autorename = true
+	copyResult, err := dbxClient.CopyV2(copyArg)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("source", selectedPath).
+			Str("destination", destinationPath).
+			Msg("Failed to copy file in Dropbox")
+
+		// Check if error is due to file already existing
+		errorMsg := fmt.Sprintf("❌ Failed to copy `%s` to wallpapers folder: %v",
+			filepath.Base(selectedPath), err)
+
+		_, sendErr := s.ChannelMessageSend(r.ChannelID, errorMsg)
+		if sendErr != nil {
+			log.Error().Err(sendErr).Msg("Failed to send error message")
+		}
+		return
+	}
+
+	// Get the final path (may be renamed if autorename was triggered)
+	finalPath := destinationPath
+	if copyResult != nil && copyResult.Metadata != nil {
+		if fileMetadata, ok := copyResult.Metadata.(*files.FileMetadata); ok {
+			finalPath = fileMetadata.PathDisplay
+		}
+	}
+
+	log.Info().
+		Str("source", selectedPath).
+		Str("destination", finalPath).
+		Msg("Successfully copied file to wallpapers")
+
+	// Send confirmation message to channel
+	// Use UserID as fallback if User() API call fails
+	userName := r.UserID
+	user, err := s.User(r.UserID)
+	if err == nil && user != nil {
+		userName = user.Username
+	}
+
+	confirmMsg := fmt.Sprintf("✅ Copied `%s` to `%s` (voted by %s)",
+		filepath.Base(selectedPath), wallpapersFolder, userName)
+
+	_, err = s.ChannelMessageSend(r.ChannelID, confirmMsg)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to send confirmation message")
+	}
+}
+
+// cleanupOldMessageTracking periodically removes old entries from the message tracking database
+func cleanupOldMessageTracking(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Msg("Stopping message tracking cleanup")
+			return
+		case <-ticker.C:
+			cutoffTime := time.Now().Add(-messageTrackingTTL).Format(time.RFC3339)
+			result, err := db.Exec(
+				"DELETE FROM message_tracking WHERE created_at < ?",
+				cutoffTime,
+			)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to cleanup old message tracking entries")
+				continue
+			}
+
+			removed, err := result.RowsAffected()
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to get rows affected")
+				continue
+			}
+
+			if removed > 0 {
+				log.Info().
+					Int64("removed_count", removed).
+					Msg("Cleaned up old message tracking entries")
+			}
+		}
+	}
 }
 
 // pollDropbox continuously polls Dropbox for new files
@@ -445,6 +614,54 @@ func markFileProcessed(metadata *files.FileMetadata) error {
 	return err
 }
 
+// storeMessageTracking stores the message ID and associated file paths in the database
+func storeMessageTracking(messageID string, filePaths []string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			log.Error().Err(err).Msg("Error rolling back transaction")
+		}
+	}()
+
+	createdAt := time.Now().Format(time.RFC3339)
+	for i, filePath := range filePaths {
+		_, err := tx.Exec(
+			"INSERT INTO message_tracking (message_id, file_path, file_index, created_at) VALUES (?, ?, ?, ?)",
+			messageID, filePath, i, createdAt,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert message tracking: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// getFilePathByMessageAndIndex retrieves the file path for a given message ID and emoji index
+func getFilePathByMessageAndIndex(messageID string, index int) (string, error) {
+	var filePath string
+	err := db.QueryRow(
+		"SELECT file_path FROM message_tracking WHERE message_id = ? AND file_index = ?",
+		messageID, index,
+	).Scan(&filePath)
+
+	if err == sql.ErrNoRows {
+		return "", nil // No file found for this message/index
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to query message tracking: %w", err)
+	}
+
+	return filePath, nil
+}
+
 // downloadAndUploadBatch downloads multiple files from Dropbox and uploads them in a single Discord message
 func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *discordgo.Session, batch []*files.FileMetadata) error {
 	// Create cache directory if it doesn't exist
@@ -572,11 +789,20 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		}
 	}()
 
-	// Create message content with all file paths
-	messageContent := strings.Join(paths, "\n")
+	// Create message content with numbered file paths
+	// Use emoji numbers for voting (1️⃣, 2️⃣, 3️⃣, 4️⃣, 5️⃣)
+	var messageLines []string
+	for i, path := range paths {
+		if i < len(numberEmojis) {
+			messageLines = append(messageLines, fmt.Sprintf("%s %s", numberEmojis[i], path))
+		} else {
+			messageLines = append(messageLines, path)
+		}
+	}
+	messageContent := strings.Join(messageLines, "\n")
 
 	// Send all files to Discord in a single message
-	_, err := dg.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+	msg, err := dg.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
 		Content: messageContent,
 		Files:   discordFiles,
 	})
@@ -584,9 +810,29 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		return fmt.Errorf("failed to send files to Discord: %w", err)
 	}
 
+	// Store the message ID with the file paths for voting in database
+	if err := storeMessageTracking(msg.ID, paths); err != nil {
+		log.Error().
+			Err(err).
+			Str("message_id", msg.ID).
+			Msg("Failed to store message tracking in database")
+		// Continue anyway since the files were uploaded
+	}
+
+	// Add number reactions to the message for voting (only up to 5 files)
+	for i := 0; i < len(paths) && i < len(numberEmojis); i++ {
+		if reactErr := dg.MessageReactionAdd(channelID, msg.ID, numberEmojis[i]); reactErr != nil {
+			log.Error().
+				Err(reactErr).
+				Str("emoji", numberEmojis[i]).
+				Msg("Failed to add reaction")
+		}
+	}
+
 	log.Info().
 		Int("file_count", len(discordFiles)).
 		Strs("files", fileNames).
+		Str("message_id", msg.ID).
 		Msg("Successfully uploaded batch to Discord")
 
 	return nil
