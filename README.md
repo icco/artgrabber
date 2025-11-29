@@ -44,6 +44,7 @@ export DROPBOX_REFRESH_TOKEN="your-refresh-token"
 
 # Optional
 export DROPBOX_FOLDER="/Photos/gallery-dl"
+export WALLPAPERS_FOLDER="/photos/wallpapers"
 export POLL_INTERVAL="5m"
 export PORT="8080"
 ```
