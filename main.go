@@ -43,6 +43,10 @@ var (
 	lastUploadTime  time.Time
 	uploadMutex     sync.Mutex
 	uploadRateLimit = time.Minute
+
+	// Message tracking for voting
+	messageFilesMutex sync.RWMutex
+	messageFiles      = make(map[string][]string) // messageID -> list of file paths
 )
 
 func main() {
@@ -118,6 +122,9 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error creating Discord session")
 	}
+
+	// Add reaction handler for voting
+	dg.AddHandler(messageReactionAddHandler)
 
 	// Open Discord connection
 	err = dg.Open()
@@ -269,6 +276,95 @@ func initDB() (*sql.DB, error) {
 
 	log.Info().Str("db_path", dbPath).Msg("Database initialized")
 	return database, nil
+}
+
+// messageReactionAddHandler handles reactions added to messages for voting
+func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
+	// Ignore reactions from the bot itself
+	if r.UserID == s.State.User.ID {
+		return
+	}
+
+	// Only process reactions in the configured channel
+	if r.ChannelID != channelID {
+		return
+	}
+
+	// Get the file paths associated with this message
+	messageFilesMutex.RLock()
+	filePaths, exists := messageFiles[r.MessageID]
+	messageFilesMutex.RUnlock()
+
+	if !exists {
+		// This message doesn't have any associated files (not our message)
+		return
+	}
+
+	// Map emoji reactions to indices
+	emojiToIndex := map[string]int{
+		"1️⃣": 0, "2️⃣": 1, "3️⃣": 2, "4️⃣": 3, "5️⃣": 4,
+	}
+
+	index, validEmoji := emojiToIndex[r.Emoji.Name]
+	if !validEmoji || index >= len(filePaths) {
+		// Not a valid voting emoji or out of range
+		return
+	}
+
+	selectedPath := filePaths[index]
+	log.Info().
+		Str("message_id", r.MessageID).
+		Str("user_id", r.UserID).
+		Str("emoji", r.Emoji.Name).
+		Int("index", index).
+		Str("file_path", selectedPath).
+		Msg("User voted for file")
+
+	// Copy the file to photos/wallpapers
+	destinationPath := "/photos/wallpapers/" + filepath.Base(selectedPath)
+
+	// Create Dropbox client
+	dbxClient := createDropboxClient()
+
+	// Copy the file in Dropbox
+	copyArg := files.NewRelocationArg(selectedPath, destinationPath)
+	_, err := dbxClient.CopyV2(copyArg)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("source", selectedPath).
+			Str("destination", destinationPath).
+			Msg("Failed to copy file in Dropbox")
+
+		// Send error message to channel
+		_, sendErr := s.ChannelMessageSend(r.ChannelID,
+			fmt.Sprintf("❌ Failed to copy `%s` to wallpapers folder: %v",
+				filepath.Base(selectedPath), err))
+		if sendErr != nil {
+			log.Error().Err(sendErr).Msg("Failed to send error message")
+		}
+		return
+	}
+
+	log.Info().
+		Str("source", selectedPath).
+		Str("destination", destinationPath).
+		Msg("Successfully copied file to wallpapers")
+
+	// Send confirmation message to channel
+	user, err := s.User(r.UserID)
+	userName := r.UserID
+	if err == nil && user != nil {
+		userName = user.Username
+	}
+
+	confirmMsg := fmt.Sprintf("✅ Copied `%s` to `photos/wallpapers` (voted by %s)",
+		filepath.Base(selectedPath), userName)
+
+	_, err = s.ChannelMessageSend(r.ChannelID, confirmMsg)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to send confirmation message")
+	}
 }
 
 // pollDropbox continuously polls Dropbox for new files
@@ -572,11 +668,21 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		}
 	}()
 
-	// Create message content with all file paths
-	messageContent := strings.Join(paths, "\n")
+	// Create message content with numbered file paths
+	// Use emoji numbers for voting (1️⃣, 2️⃣, 3️⃣, 4️⃣, 5️⃣)
+	numberEmojis := []string{"1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"}
+	var messageLines []string
+	for i, path := range paths {
+		if i < len(numberEmojis) {
+			messageLines = append(messageLines, fmt.Sprintf("%s %s", numberEmojis[i], path))
+		} else {
+			messageLines = append(messageLines, path)
+		}
+	}
+	messageContent := strings.Join(messageLines, "\n")
 
 	// Send all files to Discord in a single message
-	_, err := dg.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+	msg, err := dg.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
 		Content: messageContent,
 		Files:   discordFiles,
 	})
@@ -584,9 +690,25 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		return fmt.Errorf("failed to send files to Discord: %w", err)
 	}
 
+	// Store the message ID with the file paths for voting
+	messageFilesMutex.Lock()
+	messageFiles[msg.ID] = paths
+	messageFilesMutex.Unlock()
+
+	// Add number reactions to the message for voting (only up to 5 files)
+	for i := 0; i < len(paths) && i < len(numberEmojis); i++ {
+		if reactErr := dg.MessageReactionAdd(channelID, msg.ID, numberEmojis[i]); reactErr != nil {
+			log.Error().
+				Err(reactErr).
+				Str("emoji", numberEmojis[i]).
+				Msg("Failed to add reaction")
+		}
+	}
+
 	log.Info().
 		Int("file_count", len(discordFiles)).
 		Strs("files", fileNames).
+		Str("message_id", msg.ID).
 		Msg("Successfully uploaded batch to Discord")
 
 	return nil
