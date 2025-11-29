@@ -15,9 +15,19 @@ This guide will help you set up OAuth2 authentication for your ArtGrabber bot. O
 2. Click "Create app"
 3. Choose:
    - **API**: Scoped access
-   - **Access**: Full Dropbox or App folder (depending on your needs)
+   - **Access**: Full Dropbox (recommended) or App folder
    - **Name**: Give your app a unique name (e.g., "ArtGrabber Bot")
 4. Click "Create app"
+
+### Required Permissions
+
+The bot requires the following Dropbox API scopes:
+
+- **`files.metadata.read`** - List files in the monitored folder
+- **`files.content.read`** - Download images to upload to Discord
+- **`files.content.write`** - Copy voted images to the wallpapers folder
+
+These permissions are automatically requested when you run the OAuth setup tool in Step 3.
 
 ## Step 2: Configure OAuth Redirect URI
 

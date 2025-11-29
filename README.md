@@ -24,7 +24,12 @@ A Discord bot that monitors a Dropbox folder for new images and automatically up
 
 ### 2. Dropbox OAuth Setup
 
-Run the OAuth setup tool to get your credentials:
+The bot requires these Dropbox API permissions:
+- `files.metadata.read` - List files in the monitored folder
+- `files.content.read` - Download images to upload to Discord
+- `files.content.write` - Copy voted images to the wallpapers folder
+
+Run the OAuth setup tool to get your credentials (permissions are requested automatically):
 
 ```bash
 go run cmd/oauth-setup/main.go

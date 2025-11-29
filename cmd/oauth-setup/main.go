@@ -48,7 +48,7 @@ func main() {
 		ClientSecret: appSecret,
 		Endpoint:     dropbox.OAuthEndpoint(""),
 		RedirectURL:  fmt.Sprintf("http://localhost:%s%s", callbackPort, callbackPath),
-		Scopes:       []string{"files.content.read"},
+		Scopes:       []string{"files.metadata.read", "files.content.read", "files.content.write"},
 	}
 
 	// Generate random state for CSRF protection
