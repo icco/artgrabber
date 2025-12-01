@@ -1,6 +1,8 @@
 module github.com/icco/artgrabber
 
-go 1.25
+go 1.24.0
+
+toolchain go1.24.10
 
 require (
 	github.com/bwmarrin/discordgo v0.29.0

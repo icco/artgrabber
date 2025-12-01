@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -633,7 +634,7 @@ func getFilePathByMessageAndIndex(messageID string, index int) (string, error) {
 	result := db.Where("message_id = ? AND file_index = ?", messageID, index).First(&tracking)
 
 	if result.Error != nil {
-		if result.Error == gorm.ErrRecordNotFound {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 			return "", nil // No file found for this message/index
 		}
 		return "", fmt.Errorf("failed to query message tracking: %w", result.Error)
@@ -849,7 +850,7 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	err := db.Order("processed_at DESC").First(&lastProcessedFile).Error
 	hasLastProcessed := err == nil
 
-	if err != nil && err != gorm.ErrRecordNotFound {
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		log.Error().Err(err).Msg("Error querying last processed file")
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
