@@ -29,7 +29,7 @@ import (
 // ProcessedFile represents a file that has been processed and uploaded
 type ProcessedFile struct {
 	Path        string    `gorm:"primaryKey"`
-	Size        int64     `gorm:"not null"`
+	Size        uint64    `gorm:"not null"`
 	Modified    time.Time `gorm:"not null"`
 	ProcessedAt time.Time `gorm:"not null;index"`
 	Uploaded    bool      `gorm:"not null;default:true"`
@@ -594,7 +594,7 @@ func isFileProcessed(metadata *files.FileMetadata) bool {
 func markFileProcessed(metadata *files.FileMetadata) error {
 	processedFile := ProcessedFile{
 		Path:        metadata.PathLower,
-		Size:        int64(metadata.Size),
+		Size:        metadata.Size,
 		Modified:    metadata.ServerModified,
 		ProcessedAt: time.Now(),
 		Uploaded:    true,
