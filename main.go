@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -24,8 +23,26 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/oauth2"
-	_ "modernc.org/sqlite"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
+
+// ProcessedFile represents a file that has been processed and uploaded
+type ProcessedFile struct {
+	Path        string    `gorm:"primaryKey"`
+	Size        uint64    `gorm:"not null"`
+	Modified    time.Time `gorm:"not null"`
+	ProcessedAt time.Time `gorm:"not null;index"`
+	Uploaded    bool      `gorm:"not null;default:true"`
+}
+
+// MessageTracking represents a Discord message with file tracking for voting
+type MessageTracking struct {
+	MessageID string    `gorm:"primaryKey;not null"`
+	FilePath  string    `gorm:"not null"`
+	FileIndex int       `gorm:"primaryKey;not null"`
+	CreatedAt time.Time `gorm:"not null;index"`
+}
 
 var (
 	discordToken        string
@@ -38,7 +55,7 @@ var (
 	pollInterval        time.Duration
 	port                string
 	dataDir             string
-	db                  *sql.DB
+	db                  *gorm.DB
 	dropboxTokenSource  oauth2.TokenSource // For auto-refreshing tokens
 
 	// Rate limiting: maximum one upload per minute
@@ -124,7 +141,12 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to initialize database")
 	}
 	defer func() {
-		if err := db.Close(); err != nil {
+		sqlDB, err := db.DB()
+		if err != nil {
+			log.Error().Err(err).Msg("Error getting database instance")
+			return
+		}
+		if err := sqlDB.Close(); err != nil {
 			log.Error().Err(err).Msg("Error closing database")
 		}
 	}()
@@ -257,45 +279,22 @@ func createDropboxClient() files.Client {
 	return files.New(config)
 }
 
-// initDB initializes the SQLite database
-func initDB() (*sql.DB, error) {
+// initDB initializes the GORM database
+func initDB() (*gorm.DB, error) {
 	// Ensure data directory exists
 	if err := os.MkdirAll(dataDir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
 	dbPath := filepath.Join(dataDir, "artgrabber.db")
-	database, err := sql.Open("sqlite", dbPath)
+	database, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Create table for tracking processed files
-	schema := `
-	CREATE TABLE IF NOT EXISTS processed_files (
-		path TEXT PRIMARY KEY,
-		size INTEGER NOT NULL,
-		modified TEXT NOT NULL,
-		processed_at TEXT NOT NULL,
-		uploaded BOOLEAN NOT NULL DEFAULT 1
-	);
-	CREATE INDEX IF NOT EXISTS idx_processed_at ON processed_files(processed_at);
-	
-	CREATE TABLE IF NOT EXISTS message_tracking (
-		message_id TEXT NOT NULL,
-		file_path TEXT NOT NULL,
-		file_index INTEGER NOT NULL,
-		created_at TEXT NOT NULL,
-		PRIMARY KEY (message_id, file_index)
-	);
-	CREATE INDEX IF NOT EXISTS idx_message_created_at ON message_tracking(created_at);
-	`
-
-	if _, err := database.Exec(schema); err != nil {
-		if closeErr := database.Close(); closeErr != nil {
-			log.Error().Err(closeErr).Msg("Error closing database after schema creation failure")
-		}
-		return nil, fmt.Errorf("failed to create schema: %w", err)
+	// AutoMigrate will create tables based on the model structs
+	if err := database.AutoMigrate(&ProcessedFile{}, &MessageTracking{}); err != nil {
+		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
 	}
 
 	log.Info().Str("db_path", dbPath).Msg("Database initialized")
@@ -415,25 +414,16 @@ func cleanupOldMessageTracking(ctx context.Context) {
 			log.Info().Msg("Stopping message tracking cleanup")
 			return
 		case <-ticker.C:
-			cutoffTime := time.Now().Add(-messageTrackingTTL).Format(time.RFC3339)
-			result, err := db.Exec(
-				"DELETE FROM message_tracking WHERE created_at < ?",
-				cutoffTime,
-			)
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to cleanup old message tracking entries")
+			cutoffTime := time.Now().Add(-messageTrackingTTL)
+			result := db.Where("created_at < ?", cutoffTime).Delete(&MessageTracking{})
+			if result.Error != nil {
+				log.Error().Err(result.Error).Msg("Failed to cleanup old message tracking entries")
 				continue
 			}
 
-			removed, err := result.RowsAffected()
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to get rows affected")
-				continue
-			}
-
-			if removed > 0 {
+			if result.RowsAffected > 0 {
 				log.Info().
-					Int64("removed_count", removed).
+					Int64("removed_count", result.RowsAffected).
 					Msg("Cleaned up old message tracking entries")
 			}
 		}
@@ -585,16 +575,16 @@ func isImageFile(filename string) bool {
 
 // isFileProcessed checks if a file has already been processed
 func isFileProcessed(metadata *files.FileMetadata) bool {
-	var count int
-	err := db.QueryRow(
-		"SELECT COUNT(*) FROM processed_files WHERE path = ? AND size = ? AND modified = ?",
-		metadata.PathLower,
-		metadata.Size,
-		metadata.ServerModified.Format(time.RFC3339),
-	).Scan(&count)
+	var count int64
+	result := db.Model(&ProcessedFile{}).
+		Where("path = ? AND size = ? AND modified = ?",
+			metadata.PathLower,
+			metadata.Size,
+			metadata.ServerModified).
+		Count(&count)
 
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to check if file is processed")
+	if result.Error != nil {
+		log.Error().Err(result.Error).Msg("Failed to check if file is processed")
 		return false
 	}
 
@@ -603,42 +593,36 @@ func isFileProcessed(metadata *files.FileMetadata) bool {
 
 // markFileProcessed marks a file as processed in the database
 func markFileProcessed(metadata *files.FileMetadata) error {
-	_, err := db.Exec(
-		"INSERT OR REPLACE INTO processed_files (path, size, modified, processed_at, uploaded) VALUES (?, ?, ?, ?, ?)",
-		metadata.PathLower,
-		metadata.Size,
-		metadata.ServerModified.Format(time.RFC3339),
-		time.Now().Format(time.RFC3339),
-		true,
-	)
-	return err
+	processedFile := ProcessedFile{
+		Path:        metadata.PathLower,
+		Size:        metadata.Size,
+		Modified:    metadata.ServerModified,
+		ProcessedAt: time.Now(),
+		Uploaded:    true,
+	}
+
+	// Use Save which will insert or update
+	result := db.Save(&processedFile)
+	return result.Error
 }
 
 // storeMessageTracking stores the message ID and associated file paths in the database
 func storeMessageTracking(messageID string, filePaths []string) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() {
-		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			log.Error().Err(err).Msg("Error rolling back transaction")
-		}
-	}()
+	createdAt := time.Now()
+	var trackingRecords []MessageTracking
 
-	createdAt := time.Now().Format(time.RFC3339)
 	for i, filePath := range filePaths {
-		_, err := tx.Exec(
-			"INSERT INTO message_tracking (message_id, file_path, file_index, created_at) VALUES (?, ?, ?, ?)",
-			messageID, filePath, i, createdAt,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to insert message tracking: %w", err)
-		}
+		trackingRecords = append(trackingRecords, MessageTracking{
+			MessageID: messageID,
+			FilePath:  filePath,
+			FileIndex: i,
+			CreatedAt: createdAt,
+		})
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+	result := db.Create(&trackingRecords)
+	if result.Error != nil {
+		return fmt.Errorf("failed to insert message tracking: %w", result.Error)
 	}
 
 	return nil
@@ -646,20 +630,17 @@ func storeMessageTracking(messageID string, filePaths []string) error {
 
 // getFilePathByMessageAndIndex retrieves the file path for a given message ID and emoji index
 func getFilePathByMessageAndIndex(messageID string, index int) (string, error) {
-	var filePath string
-	err := db.QueryRow(
-		"SELECT file_path FROM message_tracking WHERE message_id = ? AND file_index = ?",
-		messageID, index,
-	).Scan(&filePath)
+	var tracking MessageTracking
+	result := db.Where("message_id = ? AND file_index = ?", messageID, index).First(&tracking)
 
-	if err == sql.ErrNoRows {
-		return "", nil // No file found for this message/index
-	}
-	if err != nil {
-		return "", fmt.Errorf("failed to query message tracking: %w", err)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return "", nil // No file found for this message/index
+		}
+		return "", fmt.Errorf("failed to query message tracking: %w", result.Error)
 	}
 
-	return filePath, nil
+	return tracking.FilePath, nil
 }
 
 // downloadAndUploadBatch downloads multiple files from Dropbox and uploads them in a single Discord message
@@ -862,26 +843,21 @@ func zerologMiddleware(next http.Handler) http.Handler {
 func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	var lastProcessed sql.NullString
-	var totalCount int
-	var lastPath sql.NullString
+	var lastProcessedFile ProcessedFile
+	var totalCount int64
 
 	// Get the most recent processed file
-	err := db.QueryRow(`
-		SELECT processed_at, path
-		FROM processed_files
-		ORDER BY processed_at DESC
-		LIMIT 1
-	`).Scan(&lastProcessed, &lastPath)
+	err := db.Order("processed_at DESC").First(&lastProcessedFile).Error
+	hasLastProcessed := err == nil
 
-	if err != nil && err != sql.ErrNoRows {
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		log.Error().Err(err).Msg("Error querying last processed file")
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	// Get total count
-	err = db.QueryRow(`SELECT COUNT(*) FROM processed_files`).Scan(&totalCount)
+	err = db.Model(&ProcessedFile{}).Count(&totalCount).Error
 	if err != nil {
 		log.Error().Err(err).Msg("Error querying total count")
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -891,37 +867,34 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	// Format the time
 	var timeStr string
 	var relativeTime string
-	if lastProcessed.Valid {
-		parsedTime, err := time.Parse(time.RFC3339, lastProcessed.String)
-		if err == nil {
-			timeStr = parsedTime.Format("2006-01-02 15:04:05 MST")
+	if hasLastProcessed {
+		timeStr = lastProcessedFile.ProcessedAt.Format("2006-01-02 15:04:05 MST")
 
-			// Calculate relative time
-			duration := time.Since(parsedTime)
-			switch {
-			case duration < time.Minute:
-				relativeTime = "just now"
-			case duration < time.Hour:
-				minutes := int(duration.Minutes())
-				if minutes == 1 {
-					relativeTime = "1 minute ago"
-				} else {
-					relativeTime = fmt.Sprintf("%d minutes ago", minutes)
-				}
-			case duration < 24*time.Hour:
-				hours := int(duration.Hours())
-				if hours == 1 {
-					relativeTime = "1 hour ago"
-				} else {
-					relativeTime = fmt.Sprintf("%d hours ago", hours)
-				}
-			default:
-				days := int(duration.Hours() / 24)
-				if days == 1 {
-					relativeTime = "1 day ago"
-				} else {
-					relativeTime = fmt.Sprintf("%d days ago", days)
-				}
+		// Calculate relative time
+		duration := time.Since(lastProcessedFile.ProcessedAt)
+		switch {
+		case duration < time.Minute:
+			relativeTime = "just now"
+		case duration < time.Hour:
+			minutes := int(duration.Minutes())
+			if minutes == 1 {
+				relativeTime = "1 minute ago"
+			} else {
+				relativeTime = fmt.Sprintf("%d minutes ago", minutes)
+			}
+		case duration < 24*time.Hour:
+			hours := int(duration.Hours())
+			if hours == 1 {
+				relativeTime = "1 hour ago"
+			} else {
+				relativeTime = fmt.Sprintf("%d hours ago", hours)
+			}
+		default:
+			days := int(duration.Hours() / 24)
+			if days == 1 {
+				relativeTime = "1 day ago"
+			} else {
+				relativeTime = fmt.Sprintf("%d days ago", days)
 			}
 		}
 	} else {
@@ -931,8 +904,8 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Get filename from path
 	var filename string
-	if lastPath.Valid {
-		filename = filepath.Base(lastPath.String)
+	if hasLastProcessed {
+		filename = filepath.Base(lastProcessedFile.Path)
 	}
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
