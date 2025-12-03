@@ -1,8 +1,8 @@
 # Build stage
 FROM golang:1.25-alpine AS builder
 
-# Install build dependencies
-RUN apk add --no-cache git ca-certificates
+# Install build dependencies (including C dependencies for sqlite3)
+RUN apk add --no-cache git ca-certificates gcc musl-dev sqlite-dev
 
 WORKDIR /app
 
@@ -15,14 +15,14 @@ RUN go mod download
 # Copy source code
 COPY main.go ./
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o artgrabber .
+# Build the application with CGO enabled
+RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o artgrabber .
 
 # Runtime stage
 FROM alpine:latest
 
-# Install ca-certificates for HTTPS
-RUN apk --no-cache add ca-certificates
+# Install ca-certificates for HTTPS and sqlite runtime libraries
+RUN apk --no-cache add ca-certificates sqlite-libs
 
 WORKDIR /root/
 
