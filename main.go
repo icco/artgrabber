@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -64,11 +63,6 @@ var (
 	dataDir             string
 	db                  *gorm.DB
 	dropboxTokenSource  oauth2.TokenSource // For auto-refreshing tokens
-
-	// Rate limiting: maximum one upload per hour
-	lastUploadTime  time.Time
-	uploadMutex     sync.Mutex
-	uploadRateLimit = time.Hour
 
 	// Message tracking for voting
 	messageTrackingTTL = 24 * time.Hour // Keep message tracking for 24 hours
@@ -124,7 +118,7 @@ func main() {
 		port = "8080"
 	}
 	if pollIntervalStr == "" {
-		pollInterval = 5 * time.Minute
+		pollInterval = 10 * time.Minute
 	} else {
 		var err error
 		pollInterval, err = time.ParseDuration(pollIntervalStr)
@@ -188,7 +182,7 @@ func main() {
 	// Start polling Dropbox for new files (client is created on each poll cycle)
 	go pollDropbox(ctx, dg)
 
-	// Start periodic delivery of images (once per hour)
+	// Start periodic delivery of images (every 30 minutes)
 	go deliverImagesPeriodically(ctx, dg)
 
 	// Start cleanup routine for message tracking
@@ -548,9 +542,9 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 	}
 }
 
-// deliverImagesPeriodically delivers images once per hour
+// deliverImagesPeriodically delivers images every 30 minutes
 func deliverImagesPeriodically(ctx context.Context, dg *discordgo.Session) {
-	ticker := time.NewTicker(1 * time.Hour)
+	ticker := time.NewTicker(30 * time.Minute)
 	defer ticker.Stop()
 
 	// Run immediately on start
@@ -631,15 +625,6 @@ func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo
 
 // processBatch processes a batch of files and uploads them in a single message
 func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient files.Client, dg *discordgo.Session) {
-	// Check rate limit before processing
-	uploadMutex.Lock()
-	timeSinceLastUpload := time.Since(lastUploadTime)
-	if timeSinceLastUpload < uploadRateLimit {
-		uploadMutex.Unlock()
-		return
-	}
-	uploadMutex.Unlock()
-
 	log.Info().
 		Int("batch_size", len(batch)).
 		Msg("Processing batch of images")
@@ -662,14 +647,6 @@ func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient fi
 			}
 		}
 
-		// Update last upload time after successful upload
-		uploadMutex.Lock()
-		lastUploadTime = time.Now()
-		uploadMutex.Unlock()
-
-		log.Info().
-			Int("batch_size", len(batch)).
-			Msg("Rate limit: batch upload complete, will wait 1 hour before next upload")
 	}
 }
 
