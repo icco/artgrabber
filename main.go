@@ -901,6 +901,20 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 	return nil
 }
 
+// formatBytes formats bytes into a human readable string
+func formatBytes(bytes uint64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := uint64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
 // zerologMiddleware adds zerolog logging to HTTP requests
 func zerologMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -926,7 +940,9 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
 	var lastDeliveredFile ImageFile
-	var totalCount int64
+	var totalCount, deliveredCount, pendingCount int64
+	var totalSize uint64
+	var oldestFile, newestFile ImageFile
 
 	// Get the most recent delivered file
 	err := db.Where("delivered = ?", true).Order("delivered_at DESC").First(&lastDeliveredFile).Error
@@ -938,12 +954,50 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get total count of delivered files
-	err = db.Model(&ImageFile{}).Where("delivered = ?", true).Count(&totalCount).Error
+	// Get total count of all files
+	err = db.Model(&ImageFile{}).Count(&totalCount).Error
 	if err != nil {
 		log.Error().Err(err).Msg("Error querying total count")
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
+	}
+
+	// Get count of delivered files
+	err = db.Model(&ImageFile{}).Where("delivered = ?", true).Count(&deliveredCount).Error
+	if err != nil {
+		log.Error().Err(err).Msg("Error querying delivered count")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Get count of pending files
+	err = db.Model(&ImageFile{}).Where("delivered = ?", false).Count(&pendingCount).Error
+	if err != nil {
+		log.Error().Err(err).Msg("Error querying pending count")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Get total size of all files
+	err = db.Model(&ImageFile{}).Select("COALESCE(SUM(size), 0)").Scan(&totalSize).Error
+	if err != nil {
+		log.Error().Err(err).Msg("Error querying total size")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Get oldest file (by modified date)
+	err = db.Order("modified ASC").First(&oldestFile).Error
+	hasOldest := err == nil
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		log.Error().Err(err).Msg("Error querying oldest file")
+	}
+
+	// Get newest file (by modified date)
+	err = db.Order("modified DESC").First(&newestFile).Error
+	hasNewest := err == nil
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		log.Error().Err(err).Msg("Error querying newest file")
 	}
 
 	// Format the time
@@ -990,6 +1044,16 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 		filename = filepath.Base(lastDeliveredFile.Path)
 	}
 
+	// Format date range
+	var dateRangeStr string
+	if hasOldest && hasNewest {
+		dateRangeStr = fmt.Sprintf("%s to %s",
+			oldestFile.Modified.Format("Jan 2006"),
+			newestFile.Modified.Format("Jan 2006"))
+	} else {
+		dateRangeStr = "N/A"
+	}
+
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1021,6 +1085,9 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
             border-radius: 4px;
             border-left: 4px solid #5865F2;
         }
+        .stat.pending {
+            border-left-color: #FFA500;
+        }
         .label {
             font-weight: 600;
             color: #666;
@@ -1045,11 +1112,35 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
             margin-top: 5px;
             word-break: break-all;
         }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .stats-grid .stat {
+            margin: 0;
+        }
+        .stat-small .value {
+            font-size: 20px;
+        }
+        .subtext {
+            color: #888;
+            font-size: 13px;
+            margin-top: 3px;
+        }
         .footer {
             margin-top: 30px;
             text-align: center;
             color: #999;
             font-size: 14px;
+        }
+        .footer a {
+            color: #5865F2;
+            text-decoration: none;
+        }
+        .footer a:hover {
+            text-decoration: underline;
         }
     </style>
 </head>
@@ -1058,15 +1149,41 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
         <h1>🎨 ArtGrabber Status</h1>
 
         <div class="stat">
-            <div class="label">Last Image Grabbed</div>
+            <div class="label">Last Image Delivered</div>
             <div class="value">%s</div>
             <div class="relative-time">%s</div>
             %s
         </div>
 
-        <div class="stat">
-            <div class="label">Total Images Processed</div>
-            <div class="value">%d</div>
+        <div class="stats-grid">
+            <div class="stat stat-small">
+                <div class="label">Total Discovered</div>
+                <div class="value">%d</div>
+                <div class="subtext">images indexed</div>
+            </div>
+            <div class="stat stat-small">
+                <div class="label">Delivered</div>
+                <div class="value">%d</div>
+                <div class="subtext">sent to Discord</div>
+            </div>
+            <div class="stat stat-small pending">
+                <div class="label">Pending</div>
+                <div class="value">%d</div>
+                <div class="subtext">awaiting delivery</div>
+            </div>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat stat-small">
+                <div class="label">Total Size</div>
+                <div class="value">%s</div>
+                <div class="subtext">across all images</div>
+            </div>
+            <div class="stat stat-small">
+                <div class="label">Date Range</div>
+                <div class="value" style="font-size: 18px;">%s</div>
+                <div class="subtext">file modified dates</div>
+            </div>
         </div>
 
         <div class="footer">
@@ -1079,7 +1196,7 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 			return fmt.Sprintf(`<div class="filename">%s</div>`, filename)
 		}
 		return ""
-	}(), totalCount, pollInterval)
+	}(), totalCount, deliveredCount, pendingCount, formatBytes(totalSize), dateRangeStr, pollInterval)
 
 	if _, err := w.Write([]byte(html)); err != nil {
 		log.Error().Err(err).Msg("Error writing homepage response")
