@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,6 +26,16 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+// DiscoveredFile represents an image file discovered in Dropbox
+type DiscoveredFile struct {
+	Path         string    `gorm:"primaryKey"`
+	Size         uint64    `gorm:"not null"`
+	Modified     time.Time `gorm:"not null"`
+	Name         string    `gorm:"not null"`
+	PathDisplay  string    `gorm:"not null"`
+	DiscoveredAt time.Time `gorm:"not null;index"`
+}
 
 // ProcessedFile represents a file that has been processed and uploaded
 type ProcessedFile struct {
@@ -75,9 +84,6 @@ var (
 )
 
 func main() {
-	// Initialize random seed for file shuffling
-	rand.Seed(time.Now().UnixNano())
-
 	// Initialize zerolog for JSON logging
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
@@ -297,7 +303,7 @@ func initDB() (*gorm.DB, error) {
 	}
 
 	// AutoMigrate will create tables based on the model structs
-	if err := database.AutoMigrate(&ProcessedFile{}, &MessageTracking{}); err != nil {
+	if err := database.AutoMigrate(&DiscoveredFile{}, &ProcessedFile{}, &MessageTracking{}); err != nil {
 		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
 	}
 
@@ -456,7 +462,7 @@ func pollDropbox(ctx context.Context, dg *discordgo.Session) {
 	}
 }
 
-// scanDropboxFolder scans the Dropbox folder for new image files
+// scanDropboxFolder scans the Dropbox folder for new image files and stores them in the database
 func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
 	log.Debug().Msg("Scanning Dropbox folder")
 
@@ -469,7 +475,7 @@ func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordg
 		return
 	}
 
-	processEntries(ctx, result.Entries, dbxClient, dg)
+	storeDiscoveredFiles(ctx, result.Entries)
 
 	// Handle pagination
 	for result.HasMore {
@@ -479,18 +485,16 @@ func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordg
 			log.Error().Err(err).Msg("Failed to continue listing Dropbox folder")
 			return
 		}
-		processEntries(ctx, result.Entries, dbxClient, dg)
+		storeDiscoveredFiles(ctx, result.Entries)
 	}
+
+	// After scanning, get 5 random unsent images and send them
+	sendRandomImages(ctx, dbxClient, dg)
 }
 
-// processEntries processes a batch of Dropbox entries
-func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient files.Client, dg *discordgo.Session) {
-	const maxBatchSize = 5
-
-	// First, collect all eligible files with a map for quick lookup
-	eligibleFilesMap := make(map[string]*files.FileMetadata)
-	// Track paths we've seen in this scan to prevent duplicates within the same scan
-	seenPaths := make(map[string]bool)
+// storeDiscoveredFiles stores discovered image files in the database
+func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
+	now := time.Now()
 
 	for _, entry := range entries {
 		select {
@@ -510,85 +514,80 @@ func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient f
 			continue
 		}
 
-		// Check if we've already processed this file (from database)
-		if isFileProcessed(fileMetadata) {
-			continue
+		// Store or update discovered file
+		discoveredFile := DiscoveredFile{
+			Path:         fileMetadata.PathLower,
+			Size:         fileMetadata.Size,
+			Modified:     fileMetadata.ServerModified,
+			Name:         fileMetadata.Name,
+			PathDisplay:  fileMetadata.PathDisplay,
+			DiscoveredAt: now,
 		}
 
-		// Check if we've already seen this path in the current scan
-		// This prevents duplicates within the same scan cycle
-		pathKey := strings.ToLower(fileMetadata.PathDisplay)
-		if seenPaths[pathKey] {
-			log.Debug().
+		// Use Save to insert or update (upsert)
+		if err := db.Save(&discoveredFile).Error; err != nil {
+			log.Error().
+				Err(err).
 				Str("path", fileMetadata.PathDisplay).
-				Msg("Skipping duplicate file in current scan")
-			continue
+				Msg("Failed to store discovered file")
 		}
-		seenPaths[pathKey] = true
-
-		// Store file metadata by path for later lookup
-		eligibleFilesMap[fileMetadata.PathLower] = fileMetadata
 	}
+}
 
-	// If no eligible files, return early
-	if len(eligibleFilesMap) == 0 {
+// sendRandomImages queries the database for 5 random unsent images and sends them
+func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
+	const maxBatchSize = 5
+
+	// Query for random files that have been discovered but not yet processed
+	var unsentFiles []DiscoveredFile
+	err := db.Model(&DiscoveredFile{}).
+		Where("path NOT IN (SELECT path FROM processed_files)").
+		Order("RANDOM()").
+		Limit(maxBatchSize).
+		Find(&unsentFiles).Error
+
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to query random unsent images")
 		return
 	}
 
-	// Use database to randomize the order of eligible files
-	// Collect paths into a slice for the SQL IN clause
-	var paths []string
-	for path := range eligibleFilesMap {
-		paths = append(paths, path)
+	if len(unsentFiles) == 0 {
+		log.Debug().Msg("No unsent images found")
+		return
 	}
 
-	// Query database with ORDER BY RANDOM() to get randomized order
-	// We'll use a raw SQL query to randomize the paths
-	var randomizedPaths []string
-	if err := db.Raw("SELECT path FROM (SELECT ? as path) ORDER BY RANDOM()", paths).Scan(&randomizedPaths).Error; err != nil {
-		// Fallback: if the above doesn't work, use a different approach
-		// Create a temporary approach using VALUES clause for SQLite
-		query := "SELECT value FROM ("
-		queryParts := make([]string, len(paths))
-		args := make([]interface{}, len(paths))
-		for i, path := range paths {
-			queryParts[i] = "SELECT ? as value"
-			args[i] = path
-		}
-		query += strings.Join(queryParts, " UNION ALL ") + ") ORDER BY RANDOM()"
+	log.Info().
+		Int("count", len(unsentFiles)).
+		Msg("Found random unsent images to send")
 
-		if err := db.Raw(query, args...).Scan(&randomizedPaths).Error; err != nil {
-			log.Error().Err(err).Msg("Failed to randomize files using database, falling back to Go shuffle")
-			// Fallback to Go shuffle if database randomization fails
-			randomizedPaths = paths
-			rand.Shuffle(len(randomizedPaths), func(i, j int) {
-				randomizedPaths[i], randomizedPaths[j] = randomizedPaths[j], randomizedPaths[i]
-			})
+	// Convert DiscoveredFile to FileMetadata for processing
+	// We need to fetch the full metadata from Dropbox
+	var batch []*files.FileMetadata
+	for _, df := range unsentFiles {
+		// Get file metadata from Dropbox
+		metadata, err := dbxClient.GetMetadata(&files.GetMetadataArg{
+			Path: df.Path,
+		})
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("path", df.Path).
+				Msg("Failed to get file metadata from Dropbox")
+			continue
 		}
+
+		fileMetadata, ok := metadata.(*files.FileMetadata)
+		if !ok {
+			log.Warn().
+				Str("path", df.Path).
+				Msg("Metadata is not a file")
+			continue
+		}
+
+		batch = append(batch, fileMetadata)
 	}
 
-	// Build the ordered list of file metadata from randomized paths
-	var eligibleFiles []*files.FileMetadata
-	for _, path := range randomizedPaths {
-		if fileMetadata, exists := eligibleFilesMap[path]; exists {
-			eligibleFiles = append(eligibleFiles, fileMetadata)
-		}
-	}
-
-	// Now process files in randomized batches
-	for i := 0; i < len(eligibleFiles); i += maxBatchSize {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		end := i + maxBatchSize
-		if end > len(eligibleFiles) {
-			end = len(eligibleFiles)
-		}
-
-		batch := eligibleFiles[i:end]
+	if len(batch) > 0 {
 		processBatch(ctx, batch, dbxClient, dg)
 	}
 }
