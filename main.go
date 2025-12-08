@@ -61,18 +61,19 @@ var (
 	db                  *gorm.DB
 	dropboxTokenSource  oauth2.TokenSource // For auto-refreshing tokens
 
-	// Rate limiting: maximum one upload per minute
+	// Rate limiting: maximum one upload per hour
 	lastUploadTime  time.Time
 	uploadMutex     sync.Mutex
-	uploadRateLimit = time.Minute
+	uploadRateLimit = time.Hour
 
 	// Message tracking for voting
 	messageTrackingTTL = 24 * time.Hour // Keep message tracking for 24 hours
 
 	// Voting emoji constants
-	numberEmojis = []string{"1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"}
+	numberEmojis = []string{"1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"}
 	emojiToIndex = map[string]int{
 		"1️⃣": 0, "2️⃣": 1, "3️⃣": 2, "4️⃣": 3, "5️⃣": 4,
+		"6️⃣": 5, "7️⃣": 6, "8️⃣": 7, "9️⃣": 8, "🔟": 9,
 	}
 )
 
@@ -182,6 +183,9 @@ func main() {
 
 	// Start polling Dropbox for new files (client is created on each poll cycle)
 	go pollDropbox(ctx, dg)
+
+	// Start periodic delivery of images (once per hour)
+	go deliverImagesPeriodically(ctx, dg)
 
 	// Start cleanup routine for message tracking
 	go cleanupOldMessageTracking(ctx)
@@ -481,8 +485,7 @@ func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordg
 		storeDiscoveredFiles(ctx, result.Entries)
 	}
 
-	// After scanning, get 5 random unsent images and send them
-	sendRandomImages(ctx, dbxClient, dg)
+	// Note: Image delivery is handled separately by deliverImagesPeriodically
 }
 
 // storeDiscoveredFiles stores discovered image files in the database
@@ -534,9 +537,31 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 	}
 }
 
+// deliverImagesPeriodically delivers images once per hour
+func deliverImagesPeriodically(ctx context.Context, dg *discordgo.Session) {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	// Run immediately on start
+	dbxClient := createDropboxClient()
+	sendRandomImages(ctx, dbxClient, dg)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Msg("Stopping periodic image delivery")
+			return
+		case <-ticker.C:
+			// Recreate client on each delivery to ensure fresh token
+			dbxClient = createDropboxClient()
+			sendRandomImages(ctx, dbxClient, dg)
+		}
+	}
+}
+
 // sendRandomImages queries the database for N random undelivered images and sends them
 func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
-	const maxBatchSize = 5
+	const maxBatchSize = 10
 
 	// Query for random files that haven't been delivered yet
 	var undeliveredFiles []ImageFile
@@ -630,7 +655,7 @@ func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient fi
 
 		log.Info().
 			Int("batch_size", len(batch)).
-			Msg("Rate limit: batch upload complete, will wait 1 minute before next upload")
+			Msg("Rate limit: batch upload complete, will wait 1 hour before next upload")
 	}
 }
 
@@ -817,7 +842,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 	}()
 
 	// Create message content with numbered file paths
-	// Use emoji numbers for voting (1️⃣, 2️⃣, 3️⃣, 4️⃣, 5️⃣)
+	// Use emoji numbers for voting (1️⃣ through 🔟)
 	var messageLines []string
 	for i, path := range paths {
 		if i < len(numberEmojis) {
@@ -846,7 +871,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		// Continue anyway since the files were uploaded
 	}
 
-	// Add number reactions to the message for voting (only up to 5 files)
+	// Add number reactions to the message for voting (only up to 10 files)
 	for i := 0; i < len(paths) && i < len(numberEmojis); i++ {
 		if reactErr := dg.MessageReactionAdd(channelID, msg.ID, numberEmojis[i]); reactErr != nil {
 			log.Error().
