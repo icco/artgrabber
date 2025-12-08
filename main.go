@@ -487,8 +487,8 @@ func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordg
 func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient files.Client, dg *discordgo.Session) {
 	const maxBatchSize = 5
 
-	// First, collect all eligible files
-	var eligibleFiles []*files.FileMetadata
+	// First, collect all eligible files with a map for quick lookup
+	eligibleFilesMap := make(map[string]*files.FileMetadata)
 	// Track paths we've seen in this scan to prevent duplicates within the same scan
 	seenPaths := make(map[string]bool)
 
@@ -526,20 +526,54 @@ func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient f
 		}
 		seenPaths[pathKey] = true
 
-		// Add to eligible files list
-		eligibleFiles = append(eligibleFiles, fileMetadata)
+		// Store file metadata by path for later lookup
+		eligibleFilesMap[fileMetadata.PathLower] = fileMetadata
 	}
 
 	// If no eligible files, return early
-	if len(eligibleFiles) == 0 {
+	if len(eligibleFilesMap) == 0 {
 		return
 	}
 
-	// Randomize the order of eligible files to ensure variety
-	// This prevents images from the same provider/folder from appearing together
-	rand.Shuffle(len(eligibleFiles), func(i, j int) {
-		eligibleFiles[i], eligibleFiles[j] = eligibleFiles[j], eligibleFiles[i]
-	})
+	// Use database to randomize the order of eligible files
+	// Collect paths into a slice for the SQL IN clause
+	var paths []string
+	for path := range eligibleFilesMap {
+		paths = append(paths, path)
+	}
+
+	// Query database with ORDER BY RANDOM() to get randomized order
+	// We'll use a raw SQL query to randomize the paths
+	var randomizedPaths []string
+	if err := db.Raw("SELECT path FROM (SELECT ? as path) ORDER BY RANDOM()", paths).Scan(&randomizedPaths).Error; err != nil {
+		// Fallback: if the above doesn't work, use a different approach
+		// Create a temporary approach using VALUES clause for SQLite
+		query := "SELECT value FROM ("
+		queryParts := make([]string, len(paths))
+		args := make([]interface{}, len(paths))
+		for i, path := range paths {
+			queryParts[i] = "SELECT ? as value"
+			args[i] = path
+		}
+		query += strings.Join(queryParts, " UNION ALL ") + ") ORDER BY RANDOM()"
+
+		if err := db.Raw(query, args...).Scan(&randomizedPaths).Error; err != nil {
+			log.Error().Err(err).Msg("Failed to randomize files using database, falling back to Go shuffle")
+			// Fallback to Go shuffle if database randomization fails
+			randomizedPaths = paths
+			rand.Shuffle(len(randomizedPaths), func(i, j int) {
+				randomizedPaths[i], randomizedPaths[j] = randomizedPaths[j], randomizedPaths[i]
+			})
+		}
+	}
+
+	// Build the ordered list of file metadata from randomized paths
+	var eligibleFiles []*files.FileMetadata
+	for _, path := range randomizedPaths {
+		if fileMetadata, exists := eligibleFilesMap[path]; exists {
+			eligibleFiles = append(eligibleFiles, fileMetadata)
+		}
+	}
 
 	// Now process files in randomized batches
 	for i := 0; i < len(eligibleFiles); i += maxBatchSize {
