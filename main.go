@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -74,6 +75,9 @@ var (
 )
 
 func main() {
+	// Initialize random seed for file shuffling
+	rand.Seed(time.Now().UnixNano())
+
 	// Initialize zerolog for JSON logging
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
@@ -482,7 +486,11 @@ func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordg
 // processEntries processes a batch of Dropbox entries
 func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient files.Client, dg *discordgo.Session) {
 	const maxBatchSize = 5
-	var batch []*files.FileMetadata
+
+	// First, collect all eligible files
+	var eligibleFiles []*files.FileMetadata
+	// Track paths we've seen in this scan to prevent duplicates within the same scan
+	seenPaths := make(map[string]bool)
 
 	for _, entry := range entries {
 		select {
@@ -502,23 +510,51 @@ func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient f
 			continue
 		}
 
-		// Check if we've already processed this file
+		// Check if we've already processed this file (from database)
 		if isFileProcessed(fileMetadata) {
 			continue
 		}
 
-		// Add to batch
-		batch = append(batch, fileMetadata)
-
-		// Process batch when we have 5 files or this is the last entry
-		if len(batch) >= maxBatchSize {
-			processBatch(ctx, batch, dbxClient, dg)
-			batch = nil
+		// Check if we've already seen this path in the current scan
+		// This prevents duplicates within the same scan cycle
+		pathKey := strings.ToLower(fileMetadata.PathDisplay)
+		if seenPaths[pathKey] {
+			log.Debug().
+				Str("path", fileMetadata.PathDisplay).
+				Msg("Skipping duplicate file in current scan")
+			continue
 		}
+		seenPaths[pathKey] = true
+
+		// Add to eligible files list
+		eligibleFiles = append(eligibleFiles, fileMetadata)
 	}
 
-	// Process any remaining files in the batch
-	if len(batch) > 0 {
+	// If no eligible files, return early
+	if len(eligibleFiles) == 0 {
+		return
+	}
+
+	// Randomize the order of eligible files to ensure variety
+	// This prevents images from the same provider/folder from appearing together
+	rand.Shuffle(len(eligibleFiles), func(i, j int) {
+		eligibleFiles[i], eligibleFiles[j] = eligibleFiles[j], eligibleFiles[i]
+	})
+
+	// Now process files in randomized batches
+	for i := 0; i < len(eligibleFiles); i += maxBatchSize {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		end := i + maxBatchSize
+		if end > len(eligibleFiles) {
+			end = len(eligibleFiles)
+		}
+
+		batch := eligibleFiles[i:end]
 		processBatch(ctx, batch, dbxClient, dg)
 	}
 }
@@ -574,9 +610,25 @@ func isImageFile(filename string) bool {
 }
 
 // isFileProcessed checks if a file has already been processed
+// It checks by path (case-insensitive) to catch duplicates even if size/modified time changes
 func isFileProcessed(metadata *files.FileMetadata) bool {
-	var count int64
+	// First check by path only to catch any duplicate paths
+	// This prevents showing the same image twice even if metadata changes
+	var countByPath int64
 	result := db.Model(&ProcessedFile{}).
+		Where("path = ?", metadata.PathLower).
+		Count(&countByPath)
+
+	if result.Error != nil {
+		log.Error().Err(result.Error).Msg("Failed to check if file is processed by path")
+		// Fall through to check by all fields
+	} else if countByPath > 0 {
+		return true
+	}
+
+	// Also check by path, size, and modified time for more precise matching
+	var count int64
+	result = db.Model(&ProcessedFile{}).
 		Where("path = ? AND size = ? AND modified = ?",
 			metadata.PathLower,
 			metadata.Size,
