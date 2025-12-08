@@ -27,23 +27,16 @@ import (
 	"gorm.io/gorm"
 )
 
-// DiscoveredFile represents an image file discovered in Dropbox
-type DiscoveredFile struct {
-	Path         string    `gorm:"primaryKey"`
-	Size         uint64    `gorm:"not null"`
-	Modified     time.Time `gorm:"not null"`
-	Name         string    `gorm:"not null"`
-	PathDisplay  string    `gorm:"not null"`
-	DiscoveredAt time.Time `gorm:"not null;index"`
-}
-
-// ProcessedFile represents a file that has been processed and uploaded
-type ProcessedFile struct {
-	Path        string    `gorm:"primaryKey"`
-	Size        uint64    `gorm:"not null"`
-	Modified    time.Time `gorm:"not null"`
-	ProcessedAt time.Time `gorm:"not null;index"`
-	Uploaded    bool      `gorm:"not null;default:true"`
+// ImageFile represents an image file discovered in Dropbox
+type ImageFile struct {
+	Path         string     `gorm:"primaryKey"`
+	Size         uint64     `gorm:"not null"`
+	Modified     time.Time  `gorm:"not null"`
+	Name         string     `gorm:"not null"`
+	PathDisplay  string     `gorm:"not null"`
+	DiscoveredAt time.Time  `gorm:"not null;index"`
+	Delivered    bool       `gorm:"not null;default:false;index"`
+	DeliveredAt  *time.Time `gorm:"index"`
 }
 
 // MessageTracking represents a Discord message with file tracking for voting
@@ -303,7 +296,7 @@ func initDB() (*gorm.DB, error) {
 	}
 
 	// AutoMigrate will create tables based on the model structs
-	if err := database.AutoMigrate(&DiscoveredFile{}, &ProcessedFile{}, &MessageTracking{}); err != nil {
+	if err := database.AutoMigrate(&ImageFile{}, &MessageTracking{}); err != nil {
 		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
 	}
 
@@ -514,8 +507,8 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 			continue
 		}
 
-		// Store or update discovered file
-		discoveredFile := DiscoveredFile{
+		// Store or update discovered file (only update if not already delivered)
+		imageFile := ImageFile{
 			Path:         fileMetadata.PathLower,
 			Size:         fileMetadata.Size,
 			Modified:     fileMetadata.ServerModified,
@@ -524,8 +517,15 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 			DiscoveredAt: now,
 		}
 
-		// Use Save to insert or update (upsert)
-		if err := db.Save(&discoveredFile).Error; err != nil {
+		// Use Save to insert or update (upsert), but preserve Delivered status if already set
+		var existing ImageFile
+		if err := db.Where("path = ?", fileMetadata.PathLower).First(&existing).Error; err == nil {
+			// File exists, preserve delivered status
+			imageFile.Delivered = existing.Delivered
+			imageFile.DeliveredAt = existing.DeliveredAt
+		}
+
+		if err := db.Save(&imageFile).Error; err != nil {
 			log.Error().
 				Err(err).
 				Str("path", fileMetadata.PathDisplay).
@@ -534,44 +534,42 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 	}
 }
 
-// sendRandomImages queries the database for 5 random unsent images and sends them
+// sendRandomImages queries the database for N random undelivered images and sends them
 func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
 	const maxBatchSize = 5
 
-	// Query for random files that have been discovered but not yet processed
-	var unsentFiles []DiscoveredFile
-	err := db.Model(&DiscoveredFile{}).
-		Where("path NOT IN (SELECT path FROM processed_files)").
+	// Query for random files that haven't been delivered yet
+	var undeliveredFiles []ImageFile
+	err := db.Model(&ImageFile{}).
+		Where("delivered = ?", false).
 		Order("RANDOM()").
 		Limit(maxBatchSize).
-		Find(&unsentFiles).Error
+		Find(&undeliveredFiles).Error
 
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to query random unsent images")
+		log.Error().Err(err).Msg("Failed to query random undelivered images")
 		return
 	}
 
-	if len(unsentFiles) == 0 {
-		log.Debug().Msg("No unsent images found")
+	if len(undeliveredFiles) == 0 {
+		log.Debug().Msg("No undelivered images found")
 		return
 	}
 
 	log.Info().
-		Int("count", len(unsentFiles)).
-		Msg("Found random unsent images to send")
+		Int("count", len(undeliveredFiles)).
+		Msg("Found random undelivered images to send")
 
-	// Convert DiscoveredFile to FileMetadata for processing
-	// We need to fetch the full metadata from Dropbox
+	// Fetch full metadata from Dropbox for processing
 	var batch []*files.FileMetadata
-	for _, df := range unsentFiles {
-		// Get file metadata from Dropbox
+	for _, img := range undeliveredFiles {
 		metadata, err := dbxClient.GetMetadata(&files.GetMetadataArg{
-			Path: df.Path,
+			Path: img.Path,
 		})
 		if err != nil {
 			log.Error().
 				Err(err).
-				Str("path", df.Path).
+				Str("path", img.Path).
 				Msg("Failed to get file metadata from Dropbox")
 			continue
 		}
@@ -579,7 +577,7 @@ func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo
 		fileMetadata, ok := metadata.(*files.FileMetadata)
 		if !ok {
 			log.Warn().
-				Str("path", df.Path).
+				Str("path", img.Path).
 				Msg("Metadata is not a file")
 			continue
 		}
@@ -614,13 +612,14 @@ func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient fi
 			Int("batch_size", len(batch)).
 			Msg("Failed to process batch")
 	} else {
-		// Mark all files as processed
+		// Mark all files as delivered
+		now := time.Now()
 		for _, fileMetadata := range batch {
-			if err := markFileProcessed(fileMetadata); err != nil {
+			if err := markAsDelivered(fileMetadata.PathLower, now); err != nil {
 				log.Error().
 					Err(err).
 					Str("path", fileMetadata.PathDisplay).
-					Msg("Failed to mark file as processed")
+					Msg("Failed to mark file as delivered")
 			}
 		}
 
@@ -642,52 +641,14 @@ func isImageFile(filename string) bool {
 	return slices.Contains(imageExtensions, ext)
 }
 
-// isFileProcessed checks if a file has already been processed
-// It checks by path (case-insensitive) to catch duplicates even if size/modified time changes
-func isFileProcessed(metadata *files.FileMetadata) bool {
-	// First check by path only to catch any duplicate paths
-	// This prevents showing the same image twice even if metadata changes
-	var countByPath int64
-	result := db.Model(&ProcessedFile{}).
-		Where("path = ?", metadata.PathLower).
-		Count(&countByPath)
-
-	if result.Error != nil {
-		log.Error().Err(result.Error).Msg("Failed to check if file is processed by path")
-		// Fall through to check by all fields
-	} else if countByPath > 0 {
-		return true
-	}
-
-	// Also check by path, size, and modified time for more precise matching
-	var count int64
-	result = db.Model(&ProcessedFile{}).
-		Where("path = ? AND size = ? AND modified = ?",
-			metadata.PathLower,
-			metadata.Size,
-			metadata.ServerModified).
-		Count(&count)
-
-	if result.Error != nil {
-		log.Error().Err(result.Error).Msg("Failed to check if file is processed")
-		return false
-	}
-
-	return count > 0
-}
-
-// markFileProcessed marks a file as processed in the database
-func markFileProcessed(metadata *files.FileMetadata) error {
-	processedFile := ProcessedFile{
-		Path:        metadata.PathLower,
-		Size:        metadata.Size,
-		Modified:    metadata.ServerModified,
-		ProcessedAt: time.Now(),
-		Uploaded:    true,
-	}
-
-	// Use Save which will insert or update
-	result := db.Save(&processedFile)
+// markAsDelivered marks a file as delivered in the database
+func markAsDelivered(path string, deliveredAt time.Time) error {
+	result := db.Model(&ImageFile{}).
+		Where("path = ?", path).
+		Updates(map[string]interface{}{
+			"delivered":    true,
+			"delivered_at": deliveredAt,
+		})
 	return result.Error
 }
 
@@ -928,21 +889,21 @@ func zerologMiddleware(next http.Handler) http.Handler {
 func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	var lastProcessedFile ProcessedFile
+	var lastDeliveredFile ImageFile
 	var totalCount int64
 
-	// Get the most recent processed file
-	err := db.Order("processed_at DESC").First(&lastProcessedFile).Error
-	hasLastProcessed := err == nil
+	// Get the most recent delivered file
+	err := db.Where("delivered = ?", true).Order("delivered_at DESC").First(&lastDeliveredFile).Error
+	hasLastDelivered := err == nil
 
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Error().Err(err).Msg("Error querying last processed file")
+		log.Error().Err(err).Msg("Error querying last delivered file")
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Get total count
-	err = db.Model(&ProcessedFile{}).Count(&totalCount).Error
+	// Get total count of delivered files
+	err = db.Model(&ImageFile{}).Where("delivered = ?", true).Count(&totalCount).Error
 	if err != nil {
 		log.Error().Err(err).Msg("Error querying total count")
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -952,11 +913,11 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	// Format the time
 	var timeStr string
 	var relativeTime string
-	if hasLastProcessed {
-		timeStr = lastProcessedFile.ProcessedAt.Format("2006-01-02 15:04:05 MST")
+	if hasLastDelivered && lastDeliveredFile.DeliveredAt != nil {
+		timeStr = lastDeliveredFile.DeliveredAt.Format("2006-01-02 15:04:05 MST")
 
 		// Calculate relative time
-		duration := time.Since(lastProcessedFile.ProcessedAt)
+		duration := time.Since(*lastDeliveredFile.DeliveredAt)
 		switch {
 		case duration < time.Minute:
 			relativeTime = "just now"
@@ -989,8 +950,8 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Get filename from path
 	var filename string
-	if hasLastProcessed {
-		filename = filepath.Base(lastProcessedFile.Path)
+	if hasLastDelivered {
+		filename = filepath.Base(lastDeliveredFile.Path)
 	}
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
