@@ -27,13 +27,20 @@ import (
 	"gorm.io/gorm"
 )
 
-// ProcessedFile represents a file that has been processed and uploaded
-type ProcessedFile struct {
-	Path        string    `gorm:"primaryKey"`
-	Size        uint64    `gorm:"not null"`
-	Modified    time.Time `gorm:"not null"`
-	ProcessedAt time.Time `gorm:"not null;index"`
-	Uploaded    bool      `gorm:"not null;default:true"`
+// ImageFile represents an image file discovered in Dropbox
+// Table name is "processed_files" for backwards compatibility
+type ImageFile struct {
+	Path        string     `gorm:"primaryKey"`
+	Size        uint64     `gorm:"not null"`
+	Modified    time.Time  `gorm:"not null"`
+	ProcessedAt time.Time  `gorm:"not null;index"`              // When first discovered
+	Delivered   bool       `gorm:"not null;default:true;index"` // Default true for backwards compat
+	DeliveredAt *time.Time `gorm:"index"`                       // When sent to Discord
+}
+
+// TableName keeps the same table name for backwards compatibility
+func (ImageFile) TableName() string {
+	return "processed_files"
 }
 
 // MessageTracking represents a Discord message with file tracking for voting
@@ -58,18 +65,19 @@ var (
 	db                  *gorm.DB
 	dropboxTokenSource  oauth2.TokenSource // For auto-refreshing tokens
 
-	// Rate limiting: maximum one upload per minute
+	// Rate limiting: maximum one upload per hour
 	lastUploadTime  time.Time
 	uploadMutex     sync.Mutex
-	uploadRateLimit = time.Minute
+	uploadRateLimit = time.Hour
 
 	// Message tracking for voting
 	messageTrackingTTL = 24 * time.Hour // Keep message tracking for 24 hours
 
 	// Voting emoji constants
-	numberEmojis = []string{"1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"}
+	numberEmojis = []string{"1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"}
 	emojiToIndex = map[string]int{
 		"1️⃣": 0, "2️⃣": 1, "3️⃣": 2, "4️⃣": 3, "5️⃣": 4,
+		"6️⃣": 5, "7️⃣": 6, "8️⃣": 7, "9️⃣": 8, "🔟": 9,
 	}
 )
 
@@ -179,6 +187,9 @@ func main() {
 
 	// Start polling Dropbox for new files (client is created on each poll cycle)
 	go pollDropbox(ctx, dg)
+
+	// Start periodic delivery of images (once per hour)
+	go deliverImagesPeriodically(ctx, dg)
 
 	// Start cleanup routine for message tracking
 	go cleanupOldMessageTracking(ctx)
@@ -292,8 +303,10 @@ func initDB() (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// AutoMigrate will create tables based on the model structs
-	if err := database.AutoMigrate(&ProcessedFile{}, &MessageTracking{}); err != nil {
+	// AutoMigrate will create/update the table schema
+	// New columns (delivered, delivered_at) will be added automatically
+	// Existing records will default to delivered=true (backwards compatible)
+	if err := database.AutoMigrate(&ImageFile{}, &MessageTracking{}); err != nil {
 		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
 	}
 
@@ -452,7 +465,7 @@ func pollDropbox(ctx context.Context, dg *discordgo.Session) {
 	}
 }
 
-// scanDropboxFolder scans the Dropbox folder for new image files
+// scanDropboxFolder scans the Dropbox folder for new image files and stores them in the database
 func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
 	log.Debug().Msg("Scanning Dropbox folder")
 
@@ -465,7 +478,7 @@ func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordg
 		return
 	}
 
-	processEntries(ctx, result.Entries, dbxClient, dg)
+	storeDiscoveredFiles(ctx, result.Entries)
 
 	// Handle pagination
 	for result.HasMore {
@@ -475,14 +488,15 @@ func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordg
 			log.Error().Err(err).Msg("Failed to continue listing Dropbox folder")
 			return
 		}
-		processEntries(ctx, result.Entries, dbxClient, dg)
+		storeDiscoveredFiles(ctx, result.Entries)
 	}
+
+	// Note: Image delivery is handled separately by deliverImagesPeriodically
 }
 
-// processEntries processes a batch of Dropbox entries
-func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient files.Client, dg *discordgo.Session) {
-	const maxBatchSize = 5
-	var batch []*files.FileMetadata
+// storeDiscoveredFiles stores discovered image files in the database
+func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
+	now := time.Now()
 
 	for _, entry := range entries {
 		select {
@@ -502,22 +516,111 @@ func processEntries(ctx context.Context, entries []files.IsMetadata, dbxClient f
 			continue
 		}
 
-		// Check if we've already processed this file
-		if isFileProcessed(fileMetadata) {
+		// Check if file already exists
+		var existing ImageFile
+		err := db.Where("path = ?", fileMetadata.PathLower).First(&existing).Error
+
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// New file - insert with delivered=false
+			imageFile := ImageFile{
+				Path:        fileMetadata.PathLower,
+				Size:        fileMetadata.Size,
+				Modified:    fileMetadata.ServerModified,
+				ProcessedAt: now,
+				Delivered:   false,
+			}
+			if err := db.Create(&imageFile).Error; err != nil {
+				log.Error().
+					Err(err).
+					Str("path", fileMetadata.PathDisplay).
+					Msg("Failed to store discovered file")
+			}
+		} else if err != nil {
+			log.Error().
+				Err(err).
+				Str("path", fileMetadata.PathDisplay).
+				Msg("Failed to check for existing file")
+		}
+		// If file exists, don't update - preserve delivered status
+	}
+}
+
+// deliverImagesPeriodically delivers images once per hour
+func deliverImagesPeriodically(ctx context.Context, dg *discordgo.Session) {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	// Run immediately on start
+	dbxClient := createDropboxClient()
+	sendRandomImages(ctx, dbxClient, dg)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Msg("Stopping periodic image delivery")
+			return
+		case <-ticker.C:
+			// Recreate client on each delivery to ensure fresh token
+			dbxClient = createDropboxClient()
+			sendRandomImages(ctx, dbxClient, dg)
+		}
+	}
+}
+
+// sendRandomImages queries the database for N random undelivered images and sends them
+func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
+	const maxBatchSize = 10
+
+	// Query for random files that haven't been delivered yet
+	var undeliveredFiles []ImageFile
+	err := db.Model(&ImageFile{}).
+		Where("delivered = ?", false).
+		Order("RANDOM()").
+		Limit(maxBatchSize).
+		Find(&undeliveredFiles).Error
+
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to query random undelivered images")
+		return
+	}
+
+	if len(undeliveredFiles) == 0 {
+		log.Debug().Msg("No undelivered images found")
+		return
+	}
+
+	log.Info().
+		Int("count", len(undeliveredFiles)).
+		Msg("Found random undelivered images to send")
+
+	// Fetch metadata from Dropbox for each file
+	var batch []*files.FileMetadata
+	for _, img := range undeliveredFiles {
+		metadata, err := dbxClient.GetMetadata(&files.GetMetadataArg{
+			Path: img.Path,
+		})
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("path", img.Path).
+				Msg("Failed to get file metadata from Dropbox, marking as delivered to skip")
+			// Mark as delivered so we don't keep retrying a missing file
+			now := time.Now()
+			_ = markAsDelivered(img.Path, now)
 			continue
 		}
 
-		// Add to batch
-		batch = append(batch, fileMetadata)
-
-		// Process batch when we have 5 files or this is the last entry
-		if len(batch) >= maxBatchSize {
-			processBatch(ctx, batch, dbxClient, dg)
-			batch = nil
+		fileMetadata, ok := metadata.(*files.FileMetadata)
+		if !ok {
+			log.Warn().
+				Str("path", img.Path).
+				Msg("Metadata is not a file")
+			continue
 		}
+
+		batch = append(batch, fileMetadata)
 	}
 
-	// Process any remaining files in the batch
 	if len(batch) > 0 {
 		processBatch(ctx, batch, dbxClient, dg)
 	}
@@ -545,13 +648,14 @@ func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient fi
 			Int("batch_size", len(batch)).
 			Msg("Failed to process batch")
 	} else {
-		// Mark all files as processed
+		// Mark all files as delivered
+		now := time.Now()
 		for _, fileMetadata := range batch {
-			if err := markFileProcessed(fileMetadata); err != nil {
+			if err := markAsDelivered(fileMetadata.PathLower, now); err != nil {
 				log.Error().
 					Err(err).
 					Str("path", fileMetadata.PathDisplay).
-					Msg("Failed to mark file as processed")
+					Msg("Failed to mark file as delivered")
 			}
 		}
 
@@ -562,7 +666,7 @@ func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient fi
 
 		log.Info().
 			Int("batch_size", len(batch)).
-			Msg("Rate limit: batch upload complete, will wait 1 minute before next upload")
+			Msg("Rate limit: batch upload complete, will wait 1 hour before next upload")
 	}
 }
 
@@ -573,36 +677,14 @@ func isImageFile(filename string) bool {
 	return slices.Contains(imageExtensions, ext)
 }
 
-// isFileProcessed checks if a file has already been processed
-func isFileProcessed(metadata *files.FileMetadata) bool {
-	var count int64
-	result := db.Model(&ProcessedFile{}).
-		Where("path = ? AND size = ? AND modified = ?",
-			metadata.PathLower,
-			metadata.Size,
-			metadata.ServerModified).
-		Count(&count)
-
-	if result.Error != nil {
-		log.Error().Err(result.Error).Msg("Failed to check if file is processed")
-		return false
-	}
-
-	return count > 0
-}
-
-// markFileProcessed marks a file as processed in the database
-func markFileProcessed(metadata *files.FileMetadata) error {
-	processedFile := ProcessedFile{
-		Path:        metadata.PathLower,
-		Size:        metadata.Size,
-		Modified:    metadata.ServerModified,
-		ProcessedAt: time.Now(),
-		Uploaded:    true,
-	}
-
-	// Use Save which will insert or update
-	result := db.Save(&processedFile)
+// markAsDelivered marks a file as delivered in the database
+func markAsDelivered(path string, deliveredAt time.Time) error {
+	result := db.Model(&ImageFile{}).
+		Where("path = ?", path).
+		Updates(map[string]interface{}{
+			"delivered":    true,
+			"delivered_at": deliveredAt,
+		})
 	return result.Error
 }
 
@@ -771,7 +853,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 	}()
 
 	// Create message content with numbered file paths
-	// Use emoji numbers for voting (1️⃣, 2️⃣, 3️⃣, 4️⃣, 5️⃣)
+	// Use emoji numbers for voting (1️⃣ through 🔟)
 	var messageLines []string
 	for i, path := range paths {
 		if i < len(numberEmojis) {
@@ -800,7 +882,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		// Continue anyway since the files were uploaded
 	}
 
-	// Add number reactions to the message for voting (only up to 5 files)
+	// Add number reactions to the message for voting (only up to 10 files)
 	for i := 0; i < len(paths) && i < len(numberEmojis); i++ {
 		if reactErr := dg.MessageReactionAdd(channelID, msg.ID, numberEmojis[i]); reactErr != nil {
 			log.Error().
@@ -843,21 +925,21 @@ func zerologMiddleware(next http.Handler) http.Handler {
 func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	var lastProcessedFile ProcessedFile
+	var lastDeliveredFile ImageFile
 	var totalCount int64
 
-	// Get the most recent processed file
-	err := db.Order("processed_at DESC").First(&lastProcessedFile).Error
-	hasLastProcessed := err == nil
+	// Get the most recent delivered file
+	err := db.Where("delivered = ?", true).Order("delivered_at DESC").First(&lastDeliveredFile).Error
+	hasLastDelivered := err == nil
 
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Error().Err(err).Msg("Error querying last processed file")
+		log.Error().Err(err).Msg("Error querying last delivered file")
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Get total count
-	err = db.Model(&ProcessedFile{}).Count(&totalCount).Error
+	// Get total count of delivered files
+	err = db.Model(&ImageFile{}).Where("delivered = ?", true).Count(&totalCount).Error
 	if err != nil {
 		log.Error().Err(err).Msg("Error querying total count")
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -867,11 +949,11 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	// Format the time
 	var timeStr string
 	var relativeTime string
-	if hasLastProcessed {
-		timeStr = lastProcessedFile.ProcessedAt.Format("2006-01-02 15:04:05 MST")
+	if hasLastDelivered && lastDeliveredFile.DeliveredAt != nil {
+		timeStr = lastDeliveredFile.DeliveredAt.Format("2006-01-02 15:04:05 MST")
 
 		// Calculate relative time
-		duration := time.Since(lastProcessedFile.ProcessedAt)
+		duration := time.Since(*lastDeliveredFile.DeliveredAt)
 		switch {
 		case duration < time.Minute:
 			relativeTime = "just now"
@@ -904,8 +986,8 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Get filename from path
 	var filename string
-	if hasLastProcessed {
-		filename = filepath.Base(lastProcessedFile.Path)
+	if hasLastDelivered {
+		filename = filepath.Base(lastDeliveredFile.Path)
 	}
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
