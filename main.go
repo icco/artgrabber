@@ -39,6 +39,25 @@ type ImageFile struct {
 	DeliveredAt  *time.Time `gorm:"index"`
 }
 
+// ProcessedFile represents the old table structure (for migration only)
+type ProcessedFile struct {
+	Path        string    `gorm:"primaryKey"`
+	Size        uint64    `gorm:"not null"`
+	Modified    time.Time `gorm:"not null"`
+	ProcessedAt time.Time `gorm:"not null;index"`
+	Uploaded    bool      `gorm:"not null;default:true"`
+}
+
+// DiscoveredFile represents the old table structure (for migration only)
+type DiscoveredFile struct {
+	Path         string    `gorm:"primaryKey"`
+	Size         uint64    `gorm:"not null"`
+	Modified     time.Time `gorm:"not null"`
+	Name         string    `gorm:"not null"`
+	PathDisplay  string    `gorm:"not null"`
+	DiscoveredAt time.Time `gorm:"not null;index"`
+}
+
 // MessageTracking represents a Discord message with file tracking for voting
 type MessageTracking struct {
 	MessageID string    `gorm:"primaryKey;not null"`
@@ -304,8 +323,205 @@ func initDB() (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
 	}
 
+	// Migrate data from old tables to ImageFile if they exist
+	if err := migrateOldTablesToImageFiles(database); err != nil {
+		log.Warn().Err(err).Msg("Failed to migrate old table data, continuing anyway")
+	}
+
 	log.Info().Str("db_path", dbPath).Msg("Database initialized")
 	return database, nil
+}
+
+// migrateOldTablesToImageFiles migrates data from old tables (ProcessedFile and DiscoveredFile) to ImageFile
+func migrateOldTablesToImageFiles(database *gorm.DB) error {
+	// First, migrate DiscoveredFile entries (if table exists)
+	if err := migrateDiscoveredFiles(database); err != nil {
+		log.Warn().Err(err).Msg("Failed to migrate discovered_files table")
+	}
+
+	// Then, migrate ProcessedFile entries (if table exists)
+	if err := migrateProcessedFiles(database); err != nil {
+		log.Warn().Err(err).Msg("Failed to migrate processed_files table")
+	}
+
+	return nil
+}
+
+// migrateDiscoveredFiles migrates data from the old DiscoveredFile table to ImageFile
+func migrateDiscoveredFiles(database *gorm.DB) error {
+	// Check if discovered_files table exists
+	var tableName string
+	err := database.Raw(`
+		SELECT name FROM sqlite_master 
+		WHERE type='table' AND name='discovered_files'
+	`).Scan(&tableName).Error
+
+	if err != nil || tableName == "" {
+		// Table doesn't exist, nothing to migrate
+		return nil
+	}
+
+	log.Info().Msg("Migrating data from discovered_files to image_files table")
+
+	// Get all discovered files
+	var discoveredFiles []DiscoveredFile
+	if err := database.Find(&discoveredFiles).Error; err != nil {
+		return fmt.Errorf("failed to query discovered_files: %w", err)
+	}
+
+	if len(discoveredFiles) == 0 {
+		return nil
+	}
+
+	// Migrate each discovered file to ImageFile
+	migratedCount := 0
+	for _, df := range discoveredFiles {
+		// Check if ImageFile already exists for this path
+		var existing ImageFile
+		err := database.Where("path = ?", df.Path).First(&existing).Error
+
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// Create new ImageFile entry (not delivered yet)
+			imageFile := ImageFile{
+				Path:         df.Path,
+				Size:         df.Size,
+				Modified:     df.Modified,
+				Name:         df.Name,
+				PathDisplay:  df.PathDisplay,
+				DiscoveredAt: df.DiscoveredAt,
+				Delivered:    false,
+				DeliveredAt:  nil,
+			}
+
+			if err := database.Create(&imageFile).Error; err != nil {
+				log.Error().
+					Err(err).
+					Str("path", df.Path).
+					Msg("Failed to migrate discovered file")
+				continue
+			}
+			migratedCount++
+		} else if err == nil {
+			// ImageFile exists, update metadata but preserve delivered status
+			existing.Size = df.Size
+			existing.Modified = df.Modified
+			existing.Name = df.Name
+			existing.PathDisplay = df.PathDisplay
+			if existing.DiscoveredAt.IsZero() {
+				existing.DiscoveredAt = df.DiscoveredAt
+			}
+			if err := database.Save(&existing).Error; err != nil {
+				log.Error().
+					Err(err).
+					Str("path", df.Path).
+					Msg("Failed to update existing image file")
+				continue
+			}
+			migratedCount++
+		} else {
+			log.Error().
+				Err(err).
+				Str("path", df.Path).
+				Msg("Error checking for existing image file")
+			continue
+		}
+	}
+
+	log.Info().
+		Int("total", len(discoveredFiles)).
+		Int("migrated", migratedCount).
+		Msg("Migration from discovered_files to image_files completed")
+
+	return nil
+}
+
+// migrateProcessedFiles migrates data from the old ProcessedFile table to ImageFile
+func migrateProcessedFiles(database *gorm.DB) error {
+	// Check if processed_files table exists
+	var tableName string
+	err := database.Raw(`
+		SELECT name FROM sqlite_master 
+		WHERE type='table' AND name='processed_files'
+	`).Scan(&tableName).Error
+
+	if err != nil || tableName == "" {
+		// Table doesn't exist, nothing to migrate
+		return nil
+	}
+
+	log.Info().Msg("Migrating data from processed_files to image_files table")
+
+	// Get all processed files
+	var processedFiles []ProcessedFile
+	if err := database.Find(&processedFiles).Error; err != nil {
+		return fmt.Errorf("failed to query processed_files: %w", err)
+	}
+
+	if len(processedFiles) == 0 {
+		return nil
+	}
+
+	// Migrate each processed file to ImageFile
+	migratedCount := 0
+	for _, pf := range processedFiles {
+		// Check if ImageFile already exists for this path
+		var existing ImageFile
+		err := database.Where("path = ?", pf.Path).First(&existing).Error
+
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// Create new ImageFile entry
+			// We don't have Name or PathDisplay from ProcessedFile, so extract from path
+			name := filepath.Base(pf.Path)
+			pathDisplay := pf.Path // Use path as PathDisplay fallback
+
+			imageFile := ImageFile{
+				Path:         pf.Path,
+				Size:         pf.Size,
+				Modified:     pf.Modified,
+				Name:         name,
+				PathDisplay:  pathDisplay,
+				DiscoveredAt: pf.ProcessedAt, // Use ProcessedAt as DiscoveredAt
+				Delivered:    true,
+				DeliveredAt:  &pf.ProcessedAt,
+			}
+
+			if err := database.Create(&imageFile).Error; err != nil {
+				log.Error().
+					Err(err).
+					Str("path", pf.Path).
+					Msg("Failed to migrate processed file")
+				continue
+			}
+			migratedCount++
+		} else if err == nil {
+			// ImageFile exists, update it to mark as delivered
+			if !existing.Delivered {
+				existing.Delivered = true
+				existing.DeliveredAt = &pf.ProcessedAt
+				if err := database.Save(&existing).Error; err != nil {
+					log.Error().
+						Err(err).
+						Str("path", pf.Path).
+						Msg("Failed to update existing image file")
+					continue
+				}
+				migratedCount++
+			}
+		} else {
+			log.Error().
+				Err(err).
+				Str("path", pf.Path).
+				Msg("Error checking for existing image file")
+			continue
+		}
+	}
+
+	log.Info().
+		Int("total", len(processedFiles)).
+		Int("migrated", migratedCount).
+		Msg("Migration from processed_files to image_files completed")
+
+	return nil
 }
 
 // messageReactionAddHandler handles reactions added to messages for voting
