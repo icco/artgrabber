@@ -522,6 +522,9 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			// New file - insert with delivered=false
+			// Note: Must use Select() to explicitly include Delivered field because
+			// GORM omits zero-value fields by default, and the schema has default:true
+			// for backwards compatibility with existing records
 			imageFile := ImageFile{
 				Path:        fileMetadata.PathLower,
 				Size:        fileMetadata.Size,
@@ -529,7 +532,7 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 				ProcessedAt: now,
 				Delivered:   false,
 			}
-			if err := db.Create(&imageFile).Error; err != nil {
+			if err := db.Select("Path", "Size", "Modified", "ProcessedAt", "Delivered").Create(&imageFile).Error; err != nil {
 				log.Error().
 					Err(err).
 					Str("path", fileMetadata.PathDisplay).
