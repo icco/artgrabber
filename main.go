@@ -30,6 +30,7 @@ import (
 // Table name is "processed_files" for backwards compatibility
 type ImageFile struct {
 	Path        string     `gorm:"primaryKey"`
+	ContentHash string     `gorm:"uniqueIndex"` // Dropbox content hash for dedup
 	Size        uint64     `gorm:"not null"`
 	Modified    time.Time  `gorm:"not null"`
 	ProcessedAt time.Time  `gorm:"not null;index"`              // When first discovered
@@ -510,35 +511,67 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 			continue
 		}
 
-		// Check if file already exists
+		// Check if file already exists by path
 		var existing ImageFile
 		err := db.Where("path = ?", fileMetadata.PathLower).First(&existing).Error
 
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// New file - insert with delivered=false
-			// Note: Must use a map to explicitly set delivered=false because GORM
-			// omits zero-value fields (false) by default, and the schema has
-			// default:true for backwards compatibility with existing records
-			result := db.Model(&ImageFile{}).Create(map[string]interface{}{
-				"path":         fileMetadata.PathLower,
-				"size":         fileMetadata.Size,
-				"modified":     fileMetadata.ServerModified,
-				"processed_at": now,
-				"delivered":    false,
-			})
-			if result.Error != nil {
-				log.Error().
-					Err(result.Error).
-					Str("path", fileMetadata.PathDisplay).
-					Msg("Failed to store discovered file")
-			}
-		} else if err != nil {
+		if err == nil {
+			// File already exists at this path - preserve delivered status
+			continue
+		}
+
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			log.Error().
 				Err(err).
 				Str("path", fileMetadata.PathDisplay).
 				Msg("Failed to check for existing file")
+			continue
 		}
-		// If file exists, don't update - preserve delivered status
+
+		// File not found by path - check if same content exists at a different path
+		if fileMetadata.ContentHash != "" {
+			var existingByHash ImageFile
+			hashErr := db.Where("content_hash = ?", fileMetadata.ContentHash).First(&existingByHash).Error
+			if hashErr == nil {
+				// Same content already exists - skip to avoid duplicate delivery
+				log.Debug().
+					Str("path", fileMetadata.PathDisplay).
+					Str("content_hash", fileMetadata.ContentHash).
+					Str("existing_path", existingByHash.Path).
+					Msg("Skipping file: same content hash already exists")
+				continue
+			} else if !errors.Is(hashErr, gorm.ErrRecordNotFound) {
+				log.Error().
+					Err(hashErr).
+					Str("path", fileMetadata.PathDisplay).
+					Msg("Failed to check for existing file by content hash")
+			}
+		}
+
+		// New file - insert with delivered=false
+		// Note: Must use a map to explicitly set delivered=false because GORM
+		// omits zero-value fields (false) by default, and the schema has
+		// default:true for backwards compatibility with existing records.
+		// Use nil for content_hash when empty so multiple files without a hash
+		// don't conflict on the unique index (SQLite treats each NULL as distinct).
+		var contentHash interface{}
+		if fileMetadata.ContentHash != "" {
+			contentHash = fileMetadata.ContentHash
+		}
+		result := db.Model(&ImageFile{}).Create(map[string]interface{}{
+			"path":         fileMetadata.PathLower,
+			"content_hash": contentHash,
+			"size":         fileMetadata.Size,
+			"modified":     fileMetadata.ServerModified,
+			"processed_at": now,
+			"delivered":    false,
+		})
+		if result.Error != nil {
+			log.Error().
+				Err(result.Error).
+				Str("path", fileMetadata.PathDisplay).
+				Msg("Failed to store discovered file")
+		}
 	}
 }
 
