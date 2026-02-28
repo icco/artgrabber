@@ -5,8 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"html"
-	"io"
 	"net/http"
 	"os"
 	"time"
@@ -86,10 +84,9 @@ func main() {
 			if errorMsg == "" {
 				errorMsg = "unknown error"
 			}
+			fmt.Printf("Authorization failed: %s\n", errorMsg)
 			errorChan <- fmt.Errorf("authorization failed: %s", errorMsg)
-			if _, err := io.WriteString(w, "Error: Authorization failed - "+html.EscapeString(errorMsg)); err != nil {
-				fmt.Printf("Failed to write error response: %v\n", err)
-			}
+			http.Error(w, "Authorization failed", http.StatusBadRequest)
 			return
 		}
 
