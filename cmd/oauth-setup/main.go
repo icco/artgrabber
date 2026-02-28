@@ -84,10 +84,9 @@ func main() {
 			if errorMsg == "" {
 				errorMsg = "unknown error"
 			}
+			fmt.Printf("Authorization failed: %s\n", errorMsg)
 			errorChan <- fmt.Errorf("authorization failed: %s", errorMsg)
-			if _, err := fmt.Fprintf(w, "Error: Authorization failed - %s", errorMsg); err != nil {
-				fmt.Printf("Failed to write error response: %v\n", err)
-			}
+			http.Error(w, "Authorization failed", http.StatusBadRequest)
 			return
 		}
 

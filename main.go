@@ -24,17 +24,18 @@ import (
 	"golang.org/x/oauth2"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ImageFile represents an image file discovered in Dropbox
 // Table name is "processed_files" for backwards compatibility
 type ImageFile struct {
 	Path        string     `gorm:"primaryKey"`
+	ContentHash *string    `gorm:"uniqueIndex"` // Dropbox content hash for dedup; NULL when unavailable
 	Size        uint64     `gorm:"not null"`
 	Modified    time.Time  `gorm:"not null"`
-	ProcessedAt time.Time  `gorm:"not null;index"`              // When first discovered
-	Delivered   bool       `gorm:"not null;default:true;index"` // Default true for backwards compat
-	DeliveredAt *time.Time `gorm:"index"`                       // When sent to Discord
+	ProcessedAt time.Time  `gorm:"not null;index"` // When first discovered
+	DeliveredAt *time.Time `gorm:"index"`          // When sent to Discord; nil means not yet delivered
 }
 
 // TableName keeps the same table name for backwards compatibility
@@ -298,8 +299,6 @@ func initDB() (*gorm.DB, error) {
 	}
 
 	// AutoMigrate will create/update the table schema
-	// New columns (delivered, delivered_at) will be added automatically
-	// Existing records will default to delivered=true (backwards compatible)
 	if err := database.AutoMigrate(&ImageFile{}, &MessageTracking{}); err != nil {
 		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
 	}
@@ -499,46 +498,38 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 		default:
 		}
 
-		// Only process files, not folders
 		fileMetadata, ok := entry.(*files.FileMetadata)
-		if !ok {
+		if !ok || !isImageFile(fileMetadata.Name) {
 			continue
 		}
 
-		// Check if it's an image file
-		if !isImageFile(fileMetadata.Name) {
-			continue
+		var contentHash *string
+		if fileMetadata.ContentHash != "" {
+			h := fileMetadata.ContentHash
+			contentHash = &h
 		}
 
-		// Check if file already exists
-		var existing ImageFile
-		err := db.Where("path = ?", fileMetadata.PathLower).First(&existing).Error
-
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// New file - insert with delivered=false
-			// Note: Must use a map to explicitly set delivered=false because GORM
-			// omits zero-value fields (false) by default, and the schema has
-			// default:true for backwards compatibility with existing records
-			result := db.Model(&ImageFile{}).Create(map[string]interface{}{
-				"path":         fileMetadata.PathLower,
-				"size":         fileMetadata.Size,
-				"modified":     fileMetadata.ServerModified,
-				"processed_at": now,
-				"delivered":    false,
-			})
-			if result.Error != nil {
-				log.Error().
-					Err(result.Error).
-					Str("path", fileMetadata.PathDisplay).
-					Msg("Failed to store discovered file")
-			}
-		} else if err != nil {
+		// Upsert on path conflict: update metadata if the file was seen before at the
+		// same path (e.g. size or modification time changed). delivered_at is not listed
+		// in DoUpdates so delivery state is never reset.
+		// If a content_hash unique-index conflict occurs instead (same content at a new
+		// path), the insert is rejected by the DB constraint; that is intentional dedup.
+		result := db.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "path"}},
+			DoUpdates: clause.AssignmentColumns([]string{"size", "modified", "processed_at", "content_hash"}),
+		}).Create(&ImageFile{
+			Path:        fileMetadata.PathLower,
+			ContentHash: contentHash,
+			Size:        fileMetadata.Size,
+			Modified:    fileMetadata.ServerModified,
+			ProcessedAt: now,
+		})
+		if result.Error != nil {
 			log.Error().
-				Err(err).
+				Err(result.Error).
 				Str("path", fileMetadata.PathDisplay).
-				Msg("Failed to check for existing file")
+				Msg("Failed to store discovered file")
 		}
-		// If file exists, don't update - preserve delivered status
 	}
 }
 
@@ -571,7 +562,7 @@ func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo
 	// Query for random files that haven't been delivered yet
 	var undeliveredFiles []ImageFile
 	err := db.Model(&ImageFile{}).
-		Where("delivered = ?", false).
+		Where("delivered_at IS NULL").
 		Order("RANDOM()").
 		Limit(maxBatchSize).
 		Find(&undeliveredFiles).Error
@@ -662,7 +653,6 @@ func markAsDelivered(path string, deliveredAt time.Time) error {
 	result := db.Model(&ImageFile{}).
 		Where("path = ?", path).
 		Updates(map[string]interface{}{
-			"delivered":    true,
 			"delivered_at": deliveredAt,
 		})
 	return result.Error
@@ -925,7 +915,7 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	var oldestFile, newestFile ImageFile
 
 	// Get the most recent delivered file
-	err := db.Where("delivered = ?", true).Order("delivered_at DESC").First(&lastDeliveredFile).Error
+	err := db.Where("delivered_at IS NOT NULL").Order("delivered_at DESC").First(&lastDeliveredFile).Error
 	hasLastDelivered := err == nil
 
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -943,7 +933,7 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get count of delivered files
-	err = db.Model(&ImageFile{}).Where("delivered = ?", true).Count(&deliveredCount).Error
+	err = db.Model(&ImageFile{}).Where("delivered_at IS NOT NULL").Count(&deliveredCount).Error
 	if err != nil {
 		log.Error().Err(err).Msg("Error querying delivered count")
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -951,7 +941,7 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get count of pending files
-	err = db.Model(&ImageFile{}).Where("delivered = ?", false).Count(&pendingCount).Error
+	err = db.Model(&ImageFile{}).Where("delivered_at IS NULL").Count(&pendingCount).Error
 	if err != nil {
 		log.Error().Err(err).Msg("Error querying pending count")
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
