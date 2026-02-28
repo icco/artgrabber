@@ -303,13 +303,6 @@ func initDB() (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
 	}
 
-	// Best-effort migration: records previously marked delivered=1 (old boolean field,
-	// since removed from the struct) but without a delivered_at value should be treated
-	// as already delivered. The 'delivered' column still exists in SQLite databases
-	// created before this migration because SQLite's AutoMigrate does not drop columns.
-	// On fresh installations the column won't exist; the error is intentionally ignored.
-	database.Exec("UPDATE processed_files SET delivered_at = processed_at WHERE delivered_at IS NULL AND delivered = 1")
-
 	log.Info().Str("db_path", dbPath).Msg("Database initialized")
 	return database, nil
 }
@@ -516,10 +509,15 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 			contentHash = &h
 		}
 
-		// Insert the file only if it is genuinely new: ON CONFLICT DO NOTHING suppresses
-		// the insert when either the primary key (Path) or the unique index (ContentHash)
-		// already exists, providing deduplication by both path and content hash in one step.
-		result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&ImageFile{
+		// Upsert on path conflict: update metadata if the file was seen before at the
+		// same path (e.g. size or modification time changed). delivered_at is not listed
+		// in DoUpdates so delivery state is never reset.
+		// If a content_hash unique-index conflict occurs instead (same content at a new
+		// path), the insert is rejected by the DB constraint; that is intentional dedup.
+		result := db.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "path"}},
+			DoUpdates: clause.AssignmentColumns([]string{"size", "modified", "processed_at", "content_hash"}),
+		}).Create(&ImageFile{
 			Path:        fileMetadata.PathLower,
 			ContentHash: contentHash,
 			Size:        fileMetadata.Size,
