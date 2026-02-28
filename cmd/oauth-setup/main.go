@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"html"
+	"io"
 	"net/http"
 	"os"
 	"time"
@@ -86,7 +87,7 @@ func main() {
 				errorMsg = "unknown error"
 			}
 			errorChan <- fmt.Errorf("authorization failed: %s", errorMsg)
-			if _, err := fmt.Fprintf(w, "Error: Authorization failed - %s", html.EscapeString(errorMsg)); err != nil {
+			if _, err := io.WriteString(w, "Error: Authorization failed - "+html.EscapeString(errorMsg)); err != nil {
 				fmt.Printf("Failed to write error response: %v\n", err)
 			}
 			return
