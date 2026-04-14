@@ -19,7 +19,7 @@ COPY main.go ./
 RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o artgrabber .
 
 # Runtime stage
-FROM alpine:3.21
+FROM alpine:3.22
 
 # Install ca-certificates for HTTPS and sqlite runtime library.
 # Build tools (gcc, git, etc.) are NOT needed at runtime.
