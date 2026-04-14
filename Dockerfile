@@ -27,8 +27,11 @@ RUN apk --no-cache add ca-certificates sqlite-libs
 
 WORKDIR /app
 
-# Create a non-root user and set up the /data directory with correct ownership.
-RUN adduser -S -u 1001 app && \
+# Create a non-root group and user, then set up the /data directory.
+# adduser -S on Alpine does NOT create a matching group automatically;
+# the group must be created explicitly before chown app:app will work.
+RUN addgroup -S app && \
+    adduser -S -u 1001 -G app app && \
     mkdir -p /data && \
     chown app:app /data
 
