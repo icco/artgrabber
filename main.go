@@ -512,8 +512,8 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 		// Upsert on path conflict: update metadata if the file was seen before at the
 		// same path (e.g. size or modification time changed). delivered_at is not listed
 		// in DoUpdates so delivery state is never reset.
-		// If a content_hash unique-index conflict occurs instead (same content at a new
-		// path), the insert is rejected by the DB constraint; that is intentional dedup.
+		// A content_hash unique-index conflict (same bytes at a different path) is
+		// intentional dedup — the error is caught below and logged at Debug, not Error.
 		result := db.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "path"}},
 			DoUpdates: clause.AssignmentColumns([]string{"size", "modified", "processed_at", "content_hash"}),
@@ -525,10 +525,18 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 			ProcessedAt: now,
 		})
 		if result.Error != nil {
-			log.Error().
-				Err(result.Error).
-				Str("path", fileMetadata.PathDisplay).
-				Msg("Failed to store discovered file")
+			// A UNIQUE constraint failure on content_hash is intentional dedup:
+			// the same image bytes already exist under a different path, so skip silently.
+			if strings.Contains(result.Error.Error(), "UNIQUE constraint failed: processed_files.content_hash") {
+				log.Debug().
+					Str("path", fileMetadata.PathDisplay).
+					Msg("Skipping file with duplicate content hash")
+			} else {
+				log.Error().
+					Err(result.Error).
+					Str("path", fileMetadata.PathDisplay).
+					Msg("Failed to store discovered file")
+			}
 		}
 	}
 }
