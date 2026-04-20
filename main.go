@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"os"
@@ -1016,10 +1017,13 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 		relativeTime = "No images processed yet"
 	}
 
-	// Get filename from path
+	// Get filename from path and HTML-escape it to prevent stored XSS.
+	// The path originates from Dropbox file metadata stored in the local DB;
+	// a maliciously-named file (e.g. `<script>…</script>.jpg`) would otherwise
+	// inject arbitrary HTML/JS into this page.
 	var filename string
 	if hasLastDelivered {
-		filename = filepath.Base(lastDeliveredFile.Path)
+		filename = html.EscapeString(filepath.Base(lastDeliveredFile.Path))
 	}
 
 	// Format date range
@@ -1032,7 +1036,7 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 		dateRangeStr = "N/A"
 	}
 
-	html := fmt.Sprintf(`<!DOCTYPE html>
+	htmlContent := fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -1176,7 +1180,7 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 		return ""
 	}(), totalCount, deliveredCount, pendingCount, formatBytes(totalSize), dateRangeStr, pollInterval)
 
-	if _, err := w.Write([]byte(html)); err != nil {
+	if _, err := w.Write([]byte(htmlContent)); err != nil {
 		log.Error().Err(err).Msg("Error writing homepage response")
 	}
 }
