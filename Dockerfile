@@ -23,7 +23,7 @@ RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o artgrabber .
 FROM alpine:3.23
 
 LABEL org.opencontainers.image.source=https://github.com/icco/artgrabber
-LABEL org.opencontainers.image.description="ghcr.io/icco/artgrabber container image"
+LABEL org.opencontainers.image.description="Discord bot that watches a Dropbox folder for new images and posts them to a Discord channel; reaction voting copies favorites to a wallpapers folder."
 LABEL org.opencontainers.image.licenses=MIT
 
 # Install ca-certificates for HTTPS and sqlite runtime library.
