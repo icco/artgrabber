@@ -19,6 +19,7 @@ import (
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox"
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/files"
 	"github.com/go-chi/chi/v5"
+	artgrabberdb "github.com/icco/artgrabber/db"
 	"github.com/icco/gutil/logging"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -287,7 +288,9 @@ func initDB() (*gorm.DB, error) {
 	}
 
 	dbPath := filepath.Join(dataDir, "artgrabber.db")
-	database, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	database, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+		Logger: artgrabberdb.NewGormLogger(log.Desugar()),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
@@ -398,7 +401,7 @@ func cleanupOldMessageTracking(ctx context.Context) {
 			return
 		case <-ticker.C:
 			cutoffTime := time.Now().Add(-messageTrackingTTL)
-			result := db.Where("created_at < ?", cutoffTime).Delete(&MessageTracking{})
+			result := db.WithContext(ctx).Where("created_at < ?", cutoffTime).Delete(&MessageTracking{})
 			if result.Error != nil {
 				l.Errorw("Failed to cleanup old message tracking entries", zap.Error(result.Error))
 				continue
@@ -487,7 +490,7 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 		// Upsert by path; delivered_at stays untouched so delivery state survives.
 		// A content_hash collision means the same bytes already live at a different
 		// path — that error is intentional dedup, handled below.
-		result := db.Clauses(clause.OnConflict{
+		result := db.WithContext(ctx).Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "path"}},
 			DoUpdates: clause.AssignmentColumns([]string{"size", "modified", "processed_at", "content_hash"}),
 		}).Create(&ImageFile{
@@ -539,7 +542,7 @@ func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo
 	const maxBatchSize = 10
 
 	var undeliveredFiles []ImageFile
-	err := db.Model(&ImageFile{}).
+	err := db.WithContext(ctx).Model(&ImageFile{}).
 		Where("delivered_at IS NULL").
 		Order("RANDOM()").
 		Limit(maxBatchSize).
@@ -861,7 +864,8 @@ func routeTag(next http.Handler) http.Handler {
 
 // homepageHandler displays the homepage with last image stats.
 func homepageHandler(w http.ResponseWriter, r *http.Request) {
-	l := logging.FromContext(r.Context())
+	ctx := r.Context()
+	l := logging.FromContext(ctx)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
 	var lastDeliveredFile ImageFile
@@ -869,7 +873,7 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	var totalSize uint64
 	var oldestFile, newestFile ImageFile
 
-	err := db.Where("delivered_at IS NOT NULL").Order("delivered_at DESC").First(&lastDeliveredFile).Error
+	err := db.WithContext(ctx).Where("delivered_at IS NOT NULL").Order("delivered_at DESC").First(&lastDeliveredFile).Error
 	hasLastDelivered := err == nil
 
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -878,41 +882,41 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = db.Model(&ImageFile{}).Count(&totalCount).Error
+	err = db.WithContext(ctx).Model(&ImageFile{}).Count(&totalCount).Error
 	if err != nil {
 		l.Errorw("Error querying total count", zap.Error(err))
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	err = db.Model(&ImageFile{}).Where("delivered_at IS NOT NULL").Count(&deliveredCount).Error
+	err = db.WithContext(ctx).Model(&ImageFile{}).Where("delivered_at IS NOT NULL").Count(&deliveredCount).Error
 	if err != nil {
 		l.Errorw("Error querying delivered count", zap.Error(err))
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	err = db.Model(&ImageFile{}).Where("delivered_at IS NULL").Count(&pendingCount).Error
+	err = db.WithContext(ctx).Model(&ImageFile{}).Where("delivered_at IS NULL").Count(&pendingCount).Error
 	if err != nil {
 		l.Errorw("Error querying pending count", zap.Error(err))
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	err = db.Model(&ImageFile{}).Select("COALESCE(SUM(size), 0)").Scan(&totalSize).Error
+	err = db.WithContext(ctx).Model(&ImageFile{}).Select("COALESCE(SUM(size), 0)").Scan(&totalSize).Error
 	if err != nil {
 		l.Errorw("Error querying total size", zap.Error(err))
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	err = db.Order("modified ASC").First(&oldestFile).Error
+	err = db.WithContext(ctx).Order("modified ASC").First(&oldestFile).Error
 	hasOldest := err == nil
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		l.Errorw("Error querying oldest file", zap.Error(err))
 	}
 
-	err = db.Order("modified DESC").First(&newestFile).Error
+	err = db.WithContext(ctx).Order("modified DESC").First(&newestFile).Error
 	hasNewest := err == nil
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		l.Errorw("Error querying newest file", zap.Error(err))
