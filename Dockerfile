@@ -14,6 +14,7 @@ RUN go mod download
 
 # Copy source code
 COPY main.go ./
+COPY db ./db
 
 # Build the application with CGO enabled
 RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o artgrabber .
