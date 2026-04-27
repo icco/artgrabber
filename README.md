@@ -103,6 +103,7 @@ task build && ./artgrabber
 - `GET /` - Status page with last upload info
 - `GET /health` - Health check
 - `GET /ready` - Readiness check (Discord connection)
+- `GET /metrics` - Prometheus metrics (otelhttp HTTP server histograms)
 
 ## Using the Voting Feature
 

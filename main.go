@@ -20,6 +20,13 @@ import (
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/files"
 	"github.com/go-chi/chi/v5"
 	"github.com/icco/gutil/logging"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 	"gorm.io/driver/sqlite"
@@ -31,8 +38,8 @@ const service = "artgrabber"
 
 var log = logging.Must(logging.NewLogger(service))
 
-// ImageFile represents an image file discovered in Dropbox
-// Table name is "processed_files" for backwards compatibility
+// ImageFile is an image discovered in Dropbox; the table is "processed_files"
+// for backwards compatibility.
 type ImageFile struct {
 	Path        string     `gorm:"primaryKey"`
 	ContentHash *string    `gorm:"uniqueIndex"` // Dropbox content hash for dedup; NULL when unavailable
@@ -42,12 +49,12 @@ type ImageFile struct {
 	DeliveredAt *time.Time `gorm:"index"`          // When sent to Discord; nil means not yet delivered
 }
 
-// TableName keeps the same table name for backwards compatibility
+// TableName pins the legacy table name.
 func (ImageFile) TableName() string {
 	return "processed_files"
 }
 
-// MessageTracking represents a Discord message with file tracking for voting
+// MessageTracking pairs a Discord message ID + emoji index to a file path.
 type MessageTracking struct {
 	MessageID string    `gorm:"primaryKey;not null"`
 	FilePath  string    `gorm:"not null"`
@@ -72,7 +79,6 @@ var (
 	// Message tracking for voting
 	messageTrackingTTL = 24 * time.Hour // Keep message tracking for 24 hours
 
-	// Voting emoji constants
 	numberEmojis = []string{"1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"}
 	emojiToIndex = map[string]int{
 		"1️⃣": 0, "2️⃣": 1, "3️⃣": 2, "4️⃣": 3, "5️⃣": 4,
@@ -83,6 +89,21 @@ var (
 func main() {
 	ctx, cancel := context.WithCancel(logging.NewContext(context.Background(), log))
 	defer cancel()
+
+	registry := prometheus.NewRegistry()
+	exporter, err := otelprom.New(otelprom.WithRegisterer(registry))
+	if err != nil {
+		log.Fatalw("otel prometheus exporter", zap.Error(err))
+	}
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
+	otel.SetMeterProvider(mp)
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := mp.Shutdown(shutdownCtx); err != nil {
+			log.Warnw("meter provider shutdown", zap.Error(err))
+		}
+	}()
 
 	discordToken = os.Getenv("DISCORD_BOT_TOKEN")
 	channelID = os.Getenv("DISCORD_CHANNEL_ID")
@@ -138,7 +159,6 @@ func main() {
 		"poll_interval", pollInterval,
 	)
 
-	var err error
 	db, err = initDB()
 	if err != nil {
 		log.Fatalw("Failed to initialize database", zap.Error(err))
@@ -178,14 +198,22 @@ func main() {
 
 	r := chi.NewRouter()
 	r.Use(logging.Middleware(log.Desugar()))
+	r.Use(routeTag)
 
 	r.Get("/", homepageHandler)
 	r.Get("/health", healthCheckHandler)
 	r.Get("/ready", readyCheckHandler(dg))
+	r.Method(http.MethodGet, "/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+
+	handler := otelhttp.NewHandler(r, service,
+		otelhttp.WithFilter(func(req *http.Request) bool {
+			return req.URL.Path != "/metrics"
+		}),
+	)
 
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           r,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -272,22 +300,17 @@ func initDB() (*gorm.DB, error) {
 	return database, nil
 }
 
-// messageReactionAddHandler handles reactions added to messages for voting
+// messageReactionAddHandler routes a vote reaction to the matching tracked file.
 func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
-	// Ignore reactions from the bot itself
 	if r.UserID == s.State.User.ID {
 		return
 	}
-
-	// Only process reactions in the configured channel
 	if r.ChannelID != channelID {
 		return
 	}
 
-	// Map emoji to index
 	index, validEmoji := emojiToIndex[r.Emoji.Name]
 	if !validEmoji {
-		// Not a valid voting emoji
 		return
 	}
 
@@ -313,14 +336,10 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 		"file_path", selectedPath,
 	)
 
-	// Copy the file to Photos/Wallpapers
 	destinationPath := filepath.Join(wallpapersFolder, filepath.Base(selectedPath))
-
-	// Create Dropbox client
 	dbxClient := createDropboxClient()
 
-	// Copy the file in Dropbox
-	// Use autorename to avoid conflicts if file already exists
+	// Autorename avoids name collisions in the wallpapers folder.
 	copyArg := files.NewRelocationArg(selectedPath, destinationPath)
 	copyArg.Autorename = true
 	copyResult, err := dbxClient.CopyV2(copyArg)
@@ -340,7 +359,6 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 		return
 	}
 
-	// Get the final path (may be renamed if autorename was triggered)
 	finalPath := destinationPath
 	if copyResult != nil && copyResult.Metadata != nil {
 		if fileMetadata, ok := copyResult.Metadata.(*files.FileMetadata); ok {
@@ -353,8 +371,6 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 		"destination", finalPath,
 	)
 
-	// Send confirmation message to channel
-	// Use UserID as fallback if User() API call fails
 	userName := r.UserID
 	user, err := s.User(r.UserID)
 	if err == nil && user != nil {
@@ -418,7 +434,7 @@ func pollDropbox(ctx context.Context, dg *discordgo.Session) {
 	}
 }
 
-// scanDropboxFolder scans the Dropbox folder for new image files and stores them in the database.
+// scanDropboxFolder lists the configured folder and persists new images.
 func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
 	l := logging.FromContext(ctx)
 	l.Debugw("Scanning Dropbox folder")
@@ -468,11 +484,9 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 			contentHash = &h
 		}
 
-		// Upsert on path conflict: update metadata if the file was seen before at the
-		// same path (e.g. size or modification time changed). delivered_at is not listed
-		// in DoUpdates so delivery state is never reset.
-		// A content_hash unique-index conflict (same bytes at a different path) is
-		// intentional dedup — the error is caught below and logged at Debug, not Error.
+		// Upsert by path; delivered_at stays untouched so delivery state survives.
+		// A content_hash collision means the same bytes already live at a different
+		// path — that error is intentional dedup, handled below.
 		result := db.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "path"}},
 			DoUpdates: clause.AssignmentColumns([]string{"size", "modified", "processed_at", "content_hash"}),
@@ -484,8 +498,6 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 			ProcessedAt: now,
 		})
 		if result.Error != nil {
-			// A UNIQUE constraint failure on content_hash is intentional dedup:
-			// the same image bytes already exist under a different path, so skip silently.
 			if strings.Contains(result.Error.Error(), "UNIQUE constraint failed: processed_files.content_hash") {
 				l.Debugw("Skipping file with duplicate content hash",
 					"path", fileMetadata.PathDisplay,
@@ -602,14 +614,14 @@ func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient fi
 	}
 }
 
-// isImageFile checks if a file is an image based on extension
+// isImageFile reports whether name has a recognized image extension.
 func isImageFile(filename string) bool {
 	ext := strings.ToLower(filepath.Ext(filename))
 	imageExtensions := []string{".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 	return slices.Contains(imageExtensions, ext)
 }
 
-// markAsDelivered marks a file as delivered in the database
+// markAsDelivered records the delivery time for a file by path.
 func markAsDelivered(path string, deliveredAt time.Time) error {
 	result := db.Model(&ImageFile{}).
 		Where("path = ?", path).
@@ -619,7 +631,8 @@ func markAsDelivered(path string, deliveredAt time.Time) error {
 	return result.Error
 }
 
-// storeMessageTracking stores the message ID and associated file paths in the database
+// storeMessageTracking persists per-file rows for a Discord message so reactions
+// can be mapped back to the chosen file.
 func storeMessageTracking(messageID string, filePaths []string) error {
 	createdAt := time.Now()
 	var trackingRecords []MessageTracking
@@ -641,18 +654,17 @@ func storeMessageTracking(messageID string, filePaths []string) error {
 	return nil
 }
 
-// getFilePathByMessageAndIndex retrieves the file path for a given message ID and emoji index
+// getFilePathByMessageAndIndex returns the file path for a (messageID, index)
+// pair, or "" if no match exists.
 func getFilePathByMessageAndIndex(messageID string, index int) (string, error) {
 	var tracking MessageTracking
 	result := db.Where("message_id = ? AND file_index = ?", messageID, index).First(&tracking)
-
 	if result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return "", nil // No file found for this message/index
+			return "", nil
 		}
 		return "", fmt.Errorf("failed to query message tracking: %w", result.Error)
 	}
-
 	return tracking.FilePath, nil
 }
 
@@ -819,7 +831,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 	return nil
 }
 
-// formatBytes formats bytes into a human readable string
+// formatBytes renders n as a human-readable size string.
 func formatBytes(bytes uint64) string {
 	const unit = 1024
 	if bytes < unit {
@@ -831,6 +843,20 @@ func formatBytes(bytes uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// routeTag stamps the chi route pattern onto otelhttp metric labels.
+func routeTag(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r)
+		labeler, ok := otelhttp.LabelerFromContext(r.Context())
+		if !ok {
+			return
+		}
+		if pattern := chi.RouteContext(r.Context()).RoutePattern(); pattern != "" {
+			labeler.Add(semconv.HTTPRoute(pattern))
+		}
+	})
 }
 
 // homepageHandler displays the homepage with last image stats.
