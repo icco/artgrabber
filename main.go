@@ -19,14 +19,17 @@ import (
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox"
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/files"
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
+	"github.com/icco/gutil/logging"
+	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+const service = "artgrabber"
+
+var log = logging.Must(logging.NewLogger(service))
 
 // ImageFile represents an image file discovered in Dropbox
 // Table name is "processed_files" for backwards compatibility
@@ -78,11 +81,9 @@ var (
 )
 
 func main() {
-	// Initialize zerolog for JSON logging
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
+	ctx, cancel := context.WithCancel(logging.NewContext(context.Background(), log))
+	defer cancel()
 
-	// Load configuration from environment variables
 	discordToken = os.Getenv("DISCORD_BOT_TOKEN")
 	channelID = os.Getenv("DISCORD_CHANNEL_ID")
 	dropboxAppKey = os.Getenv("DROPBOX_APP_KEY")
@@ -95,18 +96,17 @@ func main() {
 	pollIntervalStr := os.Getenv("POLL_INTERVAL")
 
 	if discordToken == "" {
-		log.Fatal().Msg("DISCORD_BOT_TOKEN environment variable is required")
+		log.Fatalw("DISCORD_BOT_TOKEN environment variable is required")
 	}
 	if channelID == "" {
-		log.Fatal().Msg("DISCORD_CHANNEL_ID environment variable is required")
+		log.Fatalw("DISCORD_CHANNEL_ID environment variable is required")
 	}
 	if dropboxAppKey == "" || dropboxAppSecret == "" || dropboxRefreshToken == "" {
-		log.Fatal().Msg("Dropbox OAuth credentials required: DROPBOX_APP_KEY, DROPBOX_APP_SECRET, and DROPBOX_REFRESH_TOKEN. Run 'go run cmd/oauth-setup/main.go' to set up.")
+		log.Fatalw("Dropbox OAuth credentials required: DROPBOX_APP_KEY, DROPBOX_APP_SECRET, and DROPBOX_REFRESH_TOKEN. Run 'go run cmd/oauth-setup/main.go' to set up.")
 	}
 
-	log.Info().Msg("Using Dropbox OAuth2 refresh token authentication")
-	// Initialize token source for automatic refresh
-	initDropboxTokenSource()
+	log.Infow("Using Dropbox OAuth2 refresh token authentication")
+	initDropboxTokenSource(ctx)
 	if dropboxFolder == "" {
 		dropboxFolder = "/Photos/gallery-dl"
 	}
@@ -125,88 +125,64 @@ func main() {
 		var err error
 		pollInterval, err = time.ParseDuration(pollIntervalStr)
 		if err != nil {
-			log.Fatal().Err(err).Msg("Invalid POLL_INTERVAL format")
+			log.Fatalw("Invalid POLL_INTERVAL format", zap.Error(err))
 		}
 	}
 
-	log.Info().
-		Str("dropbox_folder", dropboxFolder).
-		Str("wallpapers_folder", wallpapersFolder).
-		Str("channel_id", channelID).
-		Str("data_dir", dataDir).
-		Str("port", port).
-		Dur("poll_interval", pollInterval).
-		Msg("Starting ArtGrabber bot")
+	log.Infow("Starting ArtGrabber bot",
+		"dropbox_folder", dropboxFolder,
+		"wallpapers_folder", wallpapersFolder,
+		"channel_id", channelID,
+		"data_dir", dataDir,
+		"port", port,
+		"poll_interval", pollInterval,
+	)
 
-	// Initialize database
 	var err error
 	db, err = initDB()
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to initialize database")
+		log.Fatalw("Failed to initialize database", zap.Error(err))
 	}
 	defer func() {
 		sqlDB, err := db.DB()
 		if err != nil {
-			log.Error().Err(err).Msg("Error getting database instance")
+			log.Errorw("Error getting database instance", zap.Error(err))
 			return
 		}
 		if err := sqlDB.Close(); err != nil {
-			log.Error().Err(err).Msg("Error closing database")
+			log.Errorw("Error closing database", zap.Error(err))
 		}
 	}()
 
-	// Create Discord session
 	dg, err := discordgo.New("Bot " + discordToken)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Error creating Discord session")
+		log.Fatalw("Error creating Discord session", zap.Error(err))
 	}
 
-	// Add reaction handler for voting
 	dg.AddHandler(messageReactionAddHandler)
 
-	// Open Discord connection
-	err = dg.Open()
-	if err != nil {
-		log.Fatal().Err(err).Msg("Error opening Discord connection")
+	if err := dg.Open(); err != nil {
+		log.Fatalw("Error opening Discord connection", zap.Error(err))
 	}
 	defer func() {
 		if err := dg.Close(); err != nil {
-			log.Error().Err(err).Msg("Error closing Discord connection")
+			log.Errorw("Error closing Discord connection", zap.Error(err))
 		}
 	}()
 
-	log.Info().Msg("Bot is now running. Polling Dropbox for new files...")
+	log.Infow("Bot is now running. Polling Dropbox for new files...")
 
-	// Context for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Start polling Dropbox for new files (client is created on each poll cycle)
 	go pollDropbox(ctx, dg)
-
-	// Start periodic delivery of images (every 30 minutes)
 	go deliverImagesPeriodically(ctx, dg)
-
-	// Start cleanup routine for message tracking
 	go cleanupOldMessageTracking(ctx)
 
-	// Setup Chi web server
 	r := chi.NewRouter()
+	r.Use(logging.Middleware(log.Desugar()))
 
-	// Middleware
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(zerologMiddleware)
-	r.Use(middleware.Recoverer)
-
-	// Homepage
 	r.Get("/", homepageHandler)
-
-	// Health check endpoints
 	r.Get("/health", healthCheckHandler)
 	r.Get("/ready", readyCheckHandler(dg))
 
-	// Start HTTP server
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           r,
@@ -217,68 +193,58 @@ func main() {
 	}
 
 	go func() {
-		log.Info().Str("port", port).Msg("Starting HTTP server")
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal().Err(err).Msg("HTTP server error")
+		log.Infow("Starting HTTP server", "port", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalw("HTTP server error", zap.Error(err))
 		}
 	}()
 
-	// Wait for interrupt signal
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-sc
 
-	log.Info().Msg("Shutting down gracefully...")
+	log.Infow("Shutting down gracefully...")
 
-	// Cancel polling context
 	cancel()
 
-	// Graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Error().Err(err).Msg("HTTP server shutdown error")
+		log.Errorw("HTTP server shutdown error", zap.Error(err))
 	}
 
-	log.Info().Msg("Shutdown complete")
+	log.Infow("Shutdown complete")
 }
 
-// initDropboxTokenSource initializes the OAuth2 token source for automatic token refresh
-func initDropboxTokenSource() {
-	// Create OAuth2 config
+// initDropboxTokenSource initializes the OAuth2 token source for automatic token refresh.
+func initDropboxTokenSource(ctx context.Context) {
 	oauth2Config := &oauth2.Config{
 		ClientID:     dropboxAppKey,
 		ClientSecret: dropboxAppSecret,
 		Endpoint:     dropbox.OAuthEndpoint(""),
 	}
 
-	// Create token from refresh token
 	tok := &oauth2.Token{
 		RefreshToken: dropboxRefreshToken,
 	}
 
-	// Create token source that will automatically refresh the token
-	dropboxTokenSource = oauth2Config.TokenSource(context.Background(), tok)
+	dropboxTokenSource = oauth2Config.TokenSource(ctx, tok)
 
-	// Test that we can get a token
-	_, err := dropboxTokenSource.Token()
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to get access token from refresh token")
+	if _, err := dropboxTokenSource.Token(); err != nil {
+		log.Fatalw("Failed to get access token from refresh token", zap.Error(err))
 	}
 
-	log.Info().Msg("Successfully initialized Dropbox OAuth2 token source")
+	log.Infow("Successfully initialized Dropbox OAuth2 token source")
 }
 
-// createDropboxClient creates a Dropbox client using OAuth2 token source
+// createDropboxClient creates a Dropbox client using OAuth2 token source.
 func createDropboxClient() files.Client {
-	// Get the current access token (this will automatically refresh if needed)
 	currentToken, err := dropboxTokenSource.Token()
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to get access token from token source")
+		log.Fatalw("Failed to get access token from token source", zap.Error(err))
 	}
 
-	// Create Dropbox config and client
 	config := dropbox.Config{
 		Token: currentToken.AccessToken,
 	}
@@ -286,9 +252,8 @@ func createDropboxClient() files.Client {
 	return files.New(config)
 }
 
-// initDB initializes the GORM database
+// initDB initializes the GORM database.
 func initDB() (*gorm.DB, error) {
-	// Ensure data directory exists
 	if err := os.MkdirAll(dataDir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
@@ -299,12 +264,11 @@ func initDB() (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// AutoMigrate will create/update the table schema
 	if err := database.AutoMigrate(&ImageFile{}, &MessageTracking{}); err != nil {
 		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
 	}
 
-	log.Info().Str("db_path", dbPath).Msg("Database initialized")
+	log.Infow("Database initialized", "db_path", dbPath)
 	return database, nil
 }
 
@@ -327,29 +291,27 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 		return
 	}
 
-	// Get the file path from database
 	selectedPath, err := getFilePathByMessageAndIndex(r.MessageID, index)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Str("message_id", r.MessageID).
-			Int("index", index).
-			Msg("Failed to get file path from database")
+		log.Errorw("Failed to get file path from database",
+			"message_id", r.MessageID,
+			"index", index,
+			zap.Error(err),
+		)
 		return
 	}
 
 	if selectedPath == "" {
-		// No file found for this message/index (not our message or invalid index)
 		return
 	}
 
-	log.Info().
-		Str("message_id", r.MessageID).
-		Str("user_id", r.UserID).
-		Str("emoji", r.Emoji.Name).
-		Int("index", index).
-		Str("file_path", selectedPath).
-		Msg("User voted for file")
+	log.Infow("User voted for file",
+		"message_id", r.MessageID,
+		"user_id", r.UserID,
+		"emoji", r.Emoji.Name,
+		"index", index,
+		"file_path", selectedPath,
+	)
 
 	// Copy the file to Photos/Wallpapers
 	destinationPath := filepath.Join(wallpapersFolder, filepath.Base(selectedPath))
@@ -363,19 +325,17 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 	copyArg.Autorename = true
 	copyResult, err := dbxClient.CopyV2(copyArg)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Str("source", selectedPath).
-			Str("destination", destinationPath).
-			Msg("Failed to copy file in Dropbox")
+		log.Errorw("Failed to copy file in Dropbox",
+			"source", selectedPath,
+			"destination", destinationPath,
+			zap.Error(err),
+		)
 
-		// Check if error is due to file already existing
 		errorMsg := fmt.Sprintf("❌ Failed to copy `%s` to wallpapers folder: %v",
 			filepath.Base(selectedPath), err)
 
-		_, sendErr := s.ChannelMessageSend(r.ChannelID, errorMsg)
-		if sendErr != nil {
-			log.Error().Err(sendErr).Msg("Failed to send error message")
+		if _, sendErr := s.ChannelMessageSend(r.ChannelID, errorMsg); sendErr != nil {
+			log.Errorw("Failed to send error message", zap.Error(sendErr))
 		}
 		return
 	}
@@ -388,10 +348,10 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 		}
 	}
 
-	log.Info().
-		Str("source", selectedPath).
-		Str("destination", finalPath).
-		Msg("Successfully copied file to wallpapers")
+	log.Infow("Successfully copied file to wallpapers",
+		"source", selectedPath,
+		"destination", finalPath,
+	)
 
 	// Send confirmation message to channel
 	// Use UserID as fallback if User() API call fails
@@ -404,92 +364,90 @@ func messageReactionAddHandler(s *discordgo.Session, r *discordgo.MessageReactio
 	confirmMsg := fmt.Sprintf("✅ Copied `%s` to `%s` (voted by %s)",
 		filepath.Base(selectedPath), wallpapersFolder, userName)
 
-	_, err = s.ChannelMessageSend(r.ChannelID, confirmMsg)
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to send confirmation message")
+	if _, err = s.ChannelMessageSend(r.ChannelID, confirmMsg); err != nil {
+		log.Errorw("Failed to send confirmation message", zap.Error(err))
 	}
 }
 
-// cleanupOldMessageTracking periodically removes old entries from the message tracking database
+// cleanupOldMessageTracking periodically removes old entries from the message tracking database.
 func cleanupOldMessageTracking(ctx context.Context) {
+	l := logging.FromContext(ctx)
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info().Msg("Stopping message tracking cleanup")
+			l.Infow("Stopping message tracking cleanup")
 			return
 		case <-ticker.C:
 			cutoffTime := time.Now().Add(-messageTrackingTTL)
 			result := db.Where("created_at < ?", cutoffTime).Delete(&MessageTracking{})
 			if result.Error != nil {
-				log.Error().Err(result.Error).Msg("Failed to cleanup old message tracking entries")
+				l.Errorw("Failed to cleanup old message tracking entries", zap.Error(result.Error))
 				continue
 			}
 
 			if result.RowsAffected > 0 {
-				log.Info().
-					Int64("removed_count", result.RowsAffected).
-					Msg("Cleaned up old message tracking entries")
+				l.Infow("Cleaned up old message tracking entries",
+					"removed_count", result.RowsAffected,
+				)
 			}
 		}
 	}
 }
 
-// pollDropbox continuously polls Dropbox for new files
+// pollDropbox continuously polls Dropbox for new files.
 func pollDropbox(ctx context.Context, dg *discordgo.Session) {
+	l := logging.FromContext(ctx)
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
-	// Run immediately on start
 	dbxClient := createDropboxClient()
 	scanDropboxFolder(ctx, dbxClient, dg)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info().Msg("Stopping Dropbox polling")
+			l.Infow("Stopping Dropbox polling")
 			return
 		case <-ticker.C:
-			// Recreate client on each poll to ensure fresh token
 			dbxClient = createDropboxClient()
 			scanDropboxFolder(ctx, dbxClient, dg)
 		}
 	}
 }
 
-// scanDropboxFolder scans the Dropbox folder for new image files and stores them in the database
+// scanDropboxFolder scans the Dropbox folder for new image files and stores them in the database.
 func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
-	log.Debug().Msg("Scanning Dropbox folder")
+	l := logging.FromContext(ctx)
+	l.Debugw("Scanning Dropbox folder")
 
 	listArg := files.NewListFolderArg(dropboxFolder)
 	listArg.Recursive = true
 
 	result, err := dbxClient.ListFolder(listArg)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to list Dropbox folder")
+		l.Errorw("Failed to list Dropbox folder", zap.Error(err))
 		return
 	}
 
 	storeDiscoveredFiles(ctx, result.Entries)
 
-	// Handle pagination
 	for result.HasMore {
 		continueArg := files.NewListFolderContinueArg(result.Cursor)
 		result, err = dbxClient.ListFolderContinue(continueArg)
 		if err != nil {
-			log.Error().Err(err).Msg("Failed to continue listing Dropbox folder")
+			l.Errorw("Failed to continue listing Dropbox folder", zap.Error(err))
 			return
 		}
 		storeDiscoveredFiles(ctx, result.Entries)
 	}
-
-	// Note: Image delivery is handled separately by deliverImagesPeriodically
 }
 
-// storeDiscoveredFiles stores discovered image files in the database
+// storeDiscoveredFiles stores discovered image files in the database.
 func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
+	l := logging.FromContext(ctx)
 	now := time.Now()
 
 	for _, entry := range entries {
@@ -529,46 +487,45 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 			// A UNIQUE constraint failure on content_hash is intentional dedup:
 			// the same image bytes already exist under a different path, so skip silently.
 			if strings.Contains(result.Error.Error(), "UNIQUE constraint failed: processed_files.content_hash") {
-				log.Debug().
-					Str("path", fileMetadata.PathDisplay).
-					Msg("Skipping file with duplicate content hash")
+				l.Debugw("Skipping file with duplicate content hash",
+					"path", fileMetadata.PathDisplay,
+				)
 			} else {
-				log.Error().
-					Err(result.Error).
-					Str("path", fileMetadata.PathDisplay).
-					Msg("Failed to store discovered file")
+				l.Errorw("Failed to store discovered file",
+					"path", fileMetadata.PathDisplay,
+					zap.Error(result.Error),
+				)
 			}
 		}
 	}
 }
 
-// deliverImagesPeriodically delivers images every 30 minutes
+// deliverImagesPeriodically delivers images every 30 minutes.
 func deliverImagesPeriodically(ctx context.Context, dg *discordgo.Session) {
+	l := logging.FromContext(ctx)
 	ticker := time.NewTicker(30 * time.Minute)
 	defer ticker.Stop()
 
-	// Run immediately on start
 	dbxClient := createDropboxClient()
 	sendRandomImages(ctx, dbxClient, dg)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info().Msg("Stopping periodic image delivery")
+			l.Infow("Stopping periodic image delivery")
 			return
 		case <-ticker.C:
-			// Recreate client on each delivery to ensure fresh token
 			dbxClient = createDropboxClient()
 			sendRandomImages(ctx, dbxClient, dg)
 		}
 	}
 }
 
-// sendRandomImages queries the database for N random undelivered images and sends them
+// sendRandomImages queries the database for N random undelivered images and sends them.
 func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
+	l := logging.FromContext(ctx)
 	const maxBatchSize = 10
 
-	// Query for random files that haven't been delivered yet
 	var undeliveredFiles []ImageFile
 	err := db.Model(&ImageFile{}).
 		Where("delivered_at IS NULL").
@@ -577,31 +534,29 @@ func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo
 		Find(&undeliveredFiles).Error
 
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to query random undelivered images")
+		l.Errorw("Failed to query random undelivered images", zap.Error(err))
 		return
 	}
 
 	if len(undeliveredFiles) == 0 {
-		log.Debug().Msg("No undelivered images found")
+		l.Debugw("No undelivered images found")
 		return
 	}
 
-	log.Info().
-		Int("count", len(undeliveredFiles)).
-		Msg("Found random undelivered images to send")
+	l.Infow("Found random undelivered images to send",
+		"count", len(undeliveredFiles),
+	)
 
-	// Fetch metadata from Dropbox for each file
 	var batch []*files.FileMetadata
 	for _, img := range undeliveredFiles {
 		metadata, err := dbxClient.GetMetadata(&files.GetMetadataArg{
 			Path: img.Path,
 		})
 		if err != nil {
-			log.Error().
-				Err(err).
-				Str("path", img.Path).
-				Msg("Failed to get file metadata from Dropbox, marking as delivered to skip")
-			// Mark as delivered so we don't keep retrying a missing file
+			l.Errorw("Failed to get file metadata from Dropbox, marking as delivered to skip",
+				"path", img.Path,
+				zap.Error(err),
+			)
 			now := time.Now()
 			_ = markAsDelivered(img.Path, now)
 			continue
@@ -609,9 +564,7 @@ func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo
 
 		fileMetadata, ok := metadata.(*files.FileMetadata)
 		if !ok {
-			log.Warn().
-				Str("path", img.Path).
-				Msg("Metadata is not a file")
+			l.Warnw("Metadata is not a file", "path", img.Path)
 			continue
 		}
 
@@ -623,30 +576,29 @@ func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo
 	}
 }
 
-// processBatch processes a batch of files and uploads them in a single message
+// processBatch processes a batch of files and uploads them in a single message.
 func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient files.Client, dg *discordgo.Session) {
-	log.Info().
-		Int("batch_size", len(batch)).
-		Msg("Processing batch of images")
+	l := logging.FromContext(ctx)
+	l.Infow("Processing batch of images",
+		"batch_size", len(batch),
+	)
 
-	// Download and upload the batch
 	if err := downloadAndUploadBatch(ctx, dbxClient, dg, batch); err != nil {
-		log.Error().
-			Err(err).
-			Int("batch_size", len(batch)).
-			Msg("Failed to process batch")
-	} else {
-		// Mark all files as delivered
-		now := time.Now()
-		for _, fileMetadata := range batch {
-			if err := markAsDelivered(fileMetadata.PathLower, now); err != nil {
-				log.Error().
-					Err(err).
-					Str("path", fileMetadata.PathDisplay).
-					Msg("Failed to mark file as delivered")
-			}
-		}
+		l.Errorw("Failed to process batch",
+			"batch_size", len(batch),
+			zap.Error(err),
+		)
+		return
+	}
 
+	now := time.Now()
+	for _, fileMetadata := range batch {
+		if err := markAsDelivered(fileMetadata.PathLower, now); err != nil {
+			l.Errorw("Failed to mark file as delivered",
+				"path", fileMetadata.PathDisplay,
+				zap.Error(err),
+			)
+		}
 	}
 }
 
@@ -704,99 +656,93 @@ func getFilePathByMessageAndIndex(messageID string, index int) (string, error) {
 	return tracking.FilePath, nil
 }
 
-// downloadAndUploadBatch downloads multiple files from Dropbox and uploads them in a single Discord message
+// downloadAndUploadBatch downloads multiple files from Dropbox and uploads them in a single Discord message.
 func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *discordgo.Session, batch []*files.FileMetadata) error {
-	// Create cache directory if it doesn't exist
+	l := logging.FromContext(ctx)
+
 	cacheDir := filepath.Join(dataDir, "cache")
 	if err := os.MkdirAll(cacheDir, 0750); err != nil {
 		return fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
-	// Discord has a file size limit (8MB for free, 50MB for Nitro)
+	// Discord has a file size limit (8MB for free, 50MB for Nitro).
 	maxSize := uint64(8 * 1024 * 1024)
 
-	// Download all files and prepare Discord file objects
 	var discordFiles []*discordgo.File
 	var cacheFiles []string
 	var paths []string
 	var fileNames []string
 
-	// Clean up cache files when done
 	defer func() {
 		for _, cacheFile := range cacheFiles {
 			if removeErr := os.Remove(cacheFile); removeErr != nil {
-				log.Error().Err(removeErr).Str("file", cacheFile).Msg("Error removing cache file")
+				l.Errorw("Error removing cache file", "file", cacheFile, zap.Error(removeErr))
 			}
 		}
 	}()
 
 	for _, metadata := range batch {
-		// Check file size
 		if metadata.Size > maxSize {
-			log.Warn().
-				Str("path", metadata.PathDisplay).
-				Uint64("size", metadata.Size).
-				Msg("Skipping file: exceeds Discord limit (8MB)")
+			l.Warnw("Skipping file: exceeds Discord limit (8MB)",
+				"path", metadata.PathDisplay,
+				"size", metadata.Size,
+			)
 			continue
 		}
 
-		// Create a temporary file in the cache directory
 		cacheFile := filepath.Join(cacheDir, filepath.Base(metadata.PathLower))
 
-		// Download file from Dropbox to cache
 		downloadArg := files.NewDownloadArg(metadata.PathLower)
 		_, content, err := dbxClient.Download(downloadArg)
 		if err != nil {
-			log.Error().
-				Err(err).
-				Str("path", metadata.PathDisplay).
-				Msg("Failed to download from Dropbox")
+			l.Errorw("Failed to download from Dropbox",
+				"path", metadata.PathDisplay,
+				zap.Error(err),
+			)
 			continue
 		}
 
-		// Write to cache file
 		// #nosec G304 -- cacheFile is safely constructed using filepath.Join with filepath.Base, preventing directory traversal
 		outFile, err := os.Create(cacheFile)
 		if err != nil {
 			if closeErr := content.Close(); closeErr != nil {
-				log.Error().Err(closeErr).Msg("Error closing Dropbox content stream")
+				l.Errorw("Error closing Dropbox content stream", zap.Error(closeErr))
 			}
-			log.Error().
-				Err(err).
-				Str("path", metadata.PathDisplay).
-				Msg("Failed to create cache file")
+			l.Errorw("Failed to create cache file",
+				"path", metadata.PathDisplay,
+				zap.Error(err),
+			)
 			continue
 		}
 
 		if _, err := io.Copy(outFile, content); err != nil {
 			if closeErr := content.Close(); closeErr != nil {
-				log.Error().Err(closeErr).Msg("Error closing Dropbox content stream")
+				l.Errorw("Error closing Dropbox content stream", zap.Error(closeErr))
 			}
 			if closeErr := outFile.Close(); closeErr != nil {
-				log.Error().Err(closeErr).Msg("Error closing cache file")
+				l.Errorw("Error closing cache file", zap.Error(closeErr))
 			}
-			log.Error().
-				Err(err).
-				Str("path", metadata.PathDisplay).
-				Msg("Failed to write to cache file")
+			l.Errorw("Failed to write to cache file",
+				"path", metadata.PathDisplay,
+				zap.Error(err),
+			)
 			continue
 		}
 
 		if closeErr := content.Close(); closeErr != nil {
-			log.Error().Err(closeErr).Msg("Error closing Dropbox content stream")
+			l.Errorw("Error closing Dropbox content stream", zap.Error(closeErr))
 		}
 		if closeErr := outFile.Close(); closeErr != nil {
-			log.Error().Err(closeErr).Msg("Error closing cache file")
+			l.Errorw("Error closing cache file", zap.Error(closeErr))
 		}
 
-		// Open the cached file for reading
 		// #nosec G304 -- cacheFile is safely constructed using filepath.Join with filepath.Base, preventing directory traversal
 		cachedFile, err := os.Open(cacheFile)
 		if err != nil {
-			log.Error().
-				Err(err).
-				Str("path", metadata.PathDisplay).
-				Msg("Failed to open cached file")
+			l.Errorw("Failed to open cached file",
+				"path", metadata.PathDisplay,
+				zap.Error(err),
+			)
 			continue
 		}
 
@@ -808,31 +754,28 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		paths = append(paths, metadata.PathDisplay)
 		fileNames = append(fileNames, metadata.Name)
 
-		log.Info().
-			Str("path", metadata.PathDisplay).
-			Str("name", metadata.Name).
-			Uint64("size", metadata.Size).
-			Msg("Downloaded image for batch upload")
+		l.Infow("Downloaded image for batch upload",
+			"path", metadata.PathDisplay,
+			"name", metadata.Name,
+			"size", metadata.Size,
+		)
 	}
 
-	// If no files were successfully downloaded, return an error
 	if len(discordFiles) == 0 {
 		return fmt.Errorf("no files were successfully downloaded from batch")
 	}
 
-	// Close all file handles after sending
 	defer func() {
 		for _, df := range discordFiles {
 			if closer, ok := df.Reader.(io.Closer); ok {
 				if closeErr := closer.Close(); closeErr != nil {
-					log.Error().Err(closeErr).Msg("Error closing file reader")
+					l.Errorw("Error closing file reader", zap.Error(closeErr))
 				}
 			}
 		}
 	}()
 
-	// Create message content with numbered file paths
-	// Use emoji numbers for voting (1️⃣ through 🔟)
+	// Use emoji numbers for voting (1️⃣ through 🔟).
 	var messageLines []string
 	for i, path := range paths {
 		if i < len(numberEmojis) {
@@ -843,7 +786,6 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 	}
 	messageContent := strings.Join(messageLines, "\n")
 
-	// Send all files to Discord in a single message
 	msg, err := dg.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
 		Content: messageContent,
 		Files:   discordFiles,
@@ -852,30 +794,27 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		return fmt.Errorf("failed to send files to Discord: %w", err)
 	}
 
-	// Store the message ID with the file paths for voting in database
 	if err := storeMessageTracking(msg.ID, paths); err != nil {
-		log.Error().
-			Err(err).
-			Str("message_id", msg.ID).
-			Msg("Failed to store message tracking in database")
-		// Continue anyway since the files were uploaded
+		l.Errorw("Failed to store message tracking in database",
+			"message_id", msg.ID,
+			zap.Error(err),
+		)
 	}
 
-	// Add number reactions to the message for voting (only up to 10 files)
 	for i := 0; i < len(paths) && i < len(numberEmojis); i++ {
 		if reactErr := dg.MessageReactionAdd(channelID, msg.ID, numberEmojis[i]); reactErr != nil {
-			log.Error().
-				Err(reactErr).
-				Str("emoji", numberEmojis[i]).
-				Msg("Failed to add reaction")
+			l.Errorw("Failed to add reaction",
+				"emoji", numberEmojis[i],
+				zap.Error(reactErr),
+			)
 		}
 	}
 
-	log.Info().
-		Int("file_count", len(discordFiles)).
-		Strs("files", fileNames).
-		Str("message_id", msg.ID).
-		Msg("Successfully uploaded batch to Discord")
+	l.Infow("Successfully uploaded batch to Discord",
+		"file_count", len(discordFiles),
+		"files", fileNames,
+		"message_id", msg.ID,
+	)
 
 	return nil
 }
@@ -894,28 +833,9 @@ func formatBytes(bytes uint64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-// zerologMiddleware adds zerolog logging to HTTP requests
-func zerologMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-
-		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
-		next.ServeHTTP(ww, r)
-
-		log.Info().
-			Str("method", r.Method).
-			Str("path", r.URL.Path).
-			Int("status", ww.Status()).
-			Int("size", ww.BytesWritten()).
-			Dur("duration_ms", time.Since(start)).
-			Str("remote_addr", r.RemoteAddr).
-			Str("request_id", middleware.GetReqID(r.Context())).
-			Msg("HTTP request")
-	})
-}
-
-// homepageHandler displays the homepage with last image stats
+// homepageHandler displays the homepage with last image stats.
 func homepageHandler(w http.ResponseWriter, r *http.Request) {
+	l := logging.FromContext(r.Context())
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
 	var lastDeliveredFile ImageFile
@@ -923,60 +843,53 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	var totalSize uint64
 	var oldestFile, newestFile ImageFile
 
-	// Get the most recent delivered file
 	err := db.Where("delivered_at IS NOT NULL").Order("delivered_at DESC").First(&lastDeliveredFile).Error
 	hasLastDelivered := err == nil
 
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Error().Err(err).Msg("Error querying last delivered file")
+		l.Errorw("Error querying last delivered file", zap.Error(err))
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Get total count of all files
 	err = db.Model(&ImageFile{}).Count(&totalCount).Error
 	if err != nil {
-		log.Error().Err(err).Msg("Error querying total count")
+		l.Errorw("Error querying total count", zap.Error(err))
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Get count of delivered files
 	err = db.Model(&ImageFile{}).Where("delivered_at IS NOT NULL").Count(&deliveredCount).Error
 	if err != nil {
-		log.Error().Err(err).Msg("Error querying delivered count")
+		l.Errorw("Error querying delivered count", zap.Error(err))
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Get count of pending files
 	err = db.Model(&ImageFile{}).Where("delivered_at IS NULL").Count(&pendingCount).Error
 	if err != nil {
-		log.Error().Err(err).Msg("Error querying pending count")
+		l.Errorw("Error querying pending count", zap.Error(err))
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Get total size of all files
 	err = db.Model(&ImageFile{}).Select("COALESCE(SUM(size), 0)").Scan(&totalSize).Error
 	if err != nil {
-		log.Error().Err(err).Msg("Error querying total size")
+		l.Errorw("Error querying total size", zap.Error(err))
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Get oldest file (by modified date)
 	err = db.Order("modified ASC").First(&oldestFile).Error
 	hasOldest := err == nil
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Error().Err(err).Msg("Error querying oldest file")
+		l.Errorw("Error querying oldest file", zap.Error(err))
 	}
 
-	// Get newest file (by modified date)
 	err = db.Order("modified DESC").First(&newestFile).Error
 	hasNewest := err == nil
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Error().Err(err).Msg("Error querying newest file")
+		l.Errorw("Error querying newest file", zap.Error(err))
 	}
 
 	// Format the time
@@ -1181,36 +1094,37 @@ func homepageHandler(w http.ResponseWriter, r *http.Request) {
 	}(), totalCount, deliveredCount, pendingCount, formatBytes(totalSize), dateRangeStr, pollInterval)
 
 	if _, err := w.Write([]byte(htmlContent)); err != nil {
-		log.Error().Err(err).Msg("Error writing homepage response")
+		l.Errorw("Error writing homepage response", zap.Error(err))
 	}
 }
 
-// healthCheckHandler returns a simple health check
+// healthCheckHandler returns a simple health check.
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	l := logging.FromContext(r.Context())
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
-		log.Error().Err(err).Msg("Error writing health check response")
+		l.Errorw("Error writing health check response", zap.Error(err))
 	}
 }
 
-// readyCheckHandler returns readiness status including Discord connection
+// readyCheckHandler returns readiness status including Discord connection.
 func readyCheckHandler(dg *discordgo.Session) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		l := logging.FromContext(r.Context())
 		w.Header().Set("Content-Type", "application/json")
 
-		// Check if Discord session is ready
 		if dg == nil || !dg.DataReady {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			if _, err := w.Write([]byte(`{"status":"not_ready","discord":"disconnected"}`)); err != nil {
-				log.Error().Err(err).Msg("Error writing ready check response")
+				l.Errorw("Error writing ready check response", zap.Error(err))
 			}
 			return
 		}
 
 		w.WriteHeader(http.StatusOK)
 		if _, err := w.Write([]byte(`{"status":"ready","discord":"connected"}`)); err != nil {
-			log.Error().Err(err).Msg("Error writing ready check response")
+			l.Errorw("Error writing ready check response", zap.Error(err))
 		}
 	}
 }
