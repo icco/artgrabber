@@ -5,7 +5,7 @@ go 1.26.2
 require (
 	github.com/bwmarrin/discordgo v0.29.0
 	github.com/dropbox/dropbox-sdk-go-unofficial/v6 v6.0.5
-	github.com/go-chi/chi/v5 v5.2.5
+	github.com/go-chi/chi/v5 v5.3.0
 	github.com/icco/gutil v0.0.0-20260426171854-cab7739e3855
 	github.com/prometheus/client_golang v1.23.2
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.68.0
