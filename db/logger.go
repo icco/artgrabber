@@ -1,3 +1,5 @@
+// Package db provides database helpers, including a GORM logger that bridges
+// GORM's logger.Interface to the project's zap logging stack.
 package db
 
 import (
@@ -24,7 +26,7 @@ func NewGormLogger(base *zap.Logger) *GormLogger {
 
 // LogMode is part of gorm's logger.Interface; zap controls leveling so we
 // just return the receiver unchanged.
-func (l *GormLogger) LogMode(level logger.LogLevel) logger.Interface {
+func (l *GormLogger) LogMode(_ logger.LogLevel) logger.Interface {
 	return l
 }
 
