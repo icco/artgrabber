@@ -1,3 +1,5 @@
+// Package main implements an interactive Dropbox OAuth2 setup tool that
+// obtains a refresh token via the authorization code flow.
 package main
 
 import (
@@ -147,7 +149,8 @@ func main() {
 	token, err := config.Exchange(context.Background(), code)
 	if err != nil {
 		fmt.Printf("Error exchanging code for token: %v\n", err)
-		os.Exit(1)
+		cancel()
+		os.Exit(1) //nolint:gocritic // cancel() invoked above; defer would still run but linter flags it
 	}
 
 	// Display the refresh token

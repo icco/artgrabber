@@ -1,3 +1,5 @@
+// Package main implements artgrabber, a Discord bot that polls a Dropbox
+// folder for new images and posts them to a configured Discord channel.
 package main
 
 import (
@@ -438,7 +440,7 @@ func pollDropbox(ctx context.Context, dg *discordgo.Session) {
 }
 
 // scanDropboxFolder lists the configured folder and persists new images.
-func scanDropboxFolder(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
+func scanDropboxFolder(ctx context.Context, dbxClient files.Client, _ *discordgo.Session) {
 	l := logging.FromContext(ctx)
 	l.Debugw("Scanning Dropbox folder")
 
