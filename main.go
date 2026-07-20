@@ -499,7 +499,7 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 			Path:        fileMetadata.PathLower,
 			ContentHash: contentHash,
 			Size:        fileMetadata.Size,
-			Modified:    fileMetadata.ServerModified,
+			Modified:    time.Time(fileMetadata.ServerModified),
 			ProcessedAt: now,
 		})
 		if result.Error != nil {
