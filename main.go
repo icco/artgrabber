@@ -489,30 +489,40 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 			contentHash = &h
 		}
 
-		// Upsert by path; delivered_at stays untouched so delivery state survives.
-		// A content_hash collision means the same bytes already live at a different
-		// path — that error is intentional dedup, handled below.
-		result := db.WithContext(ctx).Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "path"}},
-			DoUpdates: clause.AssignmentColumns([]string{"size", "modified", "processed_at", "content_hash"}),
-		}).Create(&ImageFile{
+		file := &ImageFile{
 			Path:        fileMetadata.PathLower,
 			ContentHash: contentHash,
 			Size:        fileMetadata.Size,
 			Modified:    time.Time(fileMetadata.ServerModified),
 			ProcessedAt: now,
-		})
-		if result.Error != nil {
-			if strings.Contains(result.Error.Error(), "UNIQUE constraint failed: processed_files.content_hash") {
-				l.Debugw("Skipping file with duplicate content hash",
-					"path", fileMetadata.PathDisplay,
-				)
-			} else {
-				l.Errorw("Failed to store discovered file",
-					"path", fileMetadata.PathDisplay,
-					zap.Error(result.Error),
-				)
+		}
+
+		// Check the path first so an existing row can be updated without asking
+		// SQLite to raise a uniqueness error. This preserves delivery state.
+		var existing ImageFile
+		if result := db.WithContext(ctx).Where("path = ?", file.Path).Find(&existing); result.Error != nil {
+			l.Errorw("Failed to find discovered file", "path", fileMetadata.PathDisplay, zap.Error(result.Error))
+			continue
+		}
+		if existing.Path != "" {
+			result := db.WithContext(ctx).Model(&existing).Updates(map[string]any{
+				"size": file.Size, "modified": file.Modified, "processed_at": file.ProcessedAt,
+				"content_hash": file.ContentHash,
+			})
+			if result.Error != nil {
+				l.Errorw("Failed to update discovered file", "path", fileMetadata.PathDisplay, zap.Error(result.Error))
 			}
+			continue
+		}
+
+		// A hash collision means the same bytes already live at another path.
+		// DoNothing handles that race without emitting a database error; the
+		// duplicate is intentionally ignored.
+		result := db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(file)
+		if result.Error != nil {
+			l.Errorw("Failed to store discovered file", "path", fileMetadata.PathDisplay, zap.Error(result.Error))
+		} else if result.RowsAffected == 0 {
+			l.Debugw("Skipping file with duplicate content hash", "path", fileMetadata.PathDisplay)
 		}
 	}
 }
