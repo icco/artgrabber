@@ -496,6 +496,20 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 			Modified:    time.Time(fileMetadata.ServerModified),
 			ProcessedAt: now,
 		}
+		if contentHash != nil {
+			var duplicate ImageFile
+			result := db.WithContext(ctx).
+				Where("content_hash = ? AND path <> ?", *contentHash, file.Path).
+				Limit(1).Find(&duplicate)
+			if result.Error != nil {
+				l.Errorw("Failed to find duplicate content", "path", fileMetadata.PathDisplay, zap.Error(result.Error))
+				continue
+			}
+			if duplicate.Path != "" {
+				l.Debugw("Skipping file with duplicate content hash", "path", fileMetadata.PathDisplay)
+				continue
+			}
+		}
 
 		// Check the path first so an existing row can be updated without asking
 		// SQLite to raise a uniqueness error. This preserves delivery state.
