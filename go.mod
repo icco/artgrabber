@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/bwmarrin/discordgo v0.29.0
-	github.com/dropbox/dropbox-sdk-go-unofficial/v6 v6.4.0
+	github.com/dropbox/dropbox-sdk-go-unofficial/v6 v6.5.0
 	github.com/go-chi/chi/v5 v5.3.1
 	github.com/icco/gutil v0.0.0-20260623132927-4c8ee808ca1d
 	github.com/prometheus/client_golang v1.24.1
