@@ -22,8 +22,8 @@ github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+
 github.com/gorilla/websocket v1.4.2/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
-github.com/icco/gutil v1.0.11 h1:D1avCrdJf3S+3Kw7xGI4BPtCn/JVtlvxtEDee0KKaxk=
-github.com/icco/gutil v1.0.11/go.mod h1:fbBBgMtkaShMlb1Xb1hRx6MvjeZ+yOb1MSBWcwL/eC0=
+github.com/icco/gutil v1.0.15 h1:3JEZExJLS0DIWfsmhQtHxSwM7phcSbxcJSGdF0Kty5s=
+github.com/icco/gutil v1.0.15/go.mod h1:ibHFg03Lqo35clThsx1/pmM/4RkhueE9jOKT4mXN+AA=
 github.com/jinzhu/inflection v1.0.0 h1:K317FqzuhWc8YvSVlFMCCUb36O/S9MCKRDI7QkRKD/E=
 github.com/jinzhu/inflection v1.0.0/go.mod h1:h+uFLlag+Qp1Va5pdKtLDYj+kHp5pxUVkryuEj+Srlc=
 github.com/jinzhu/now v1.1.5 h1:/o9tlHleP7gOFmsnYNz3RGnqzefHA47wQpKrrdTIwXQ=
