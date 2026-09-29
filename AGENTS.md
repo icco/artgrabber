@@ -4,7 +4,7 @@ Guidance for coding agents working on artgrabber.
 
 ## Project Overview
 
-A bot written in Go (`github.com/icco/artgrabber`) for syncing art and wallpapers to Dropbox.
+A bot written in Go (`go.icco.me/artgrabber`) for syncing art and wallpapers to Dropbox.
 
 ## Commands (Taskfile)
 
