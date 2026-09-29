@@ -1,4 +1,4 @@
-module github.com/icco/artgrabber
+module go.icco.me/artgrabber
 
 go 1.26.2
 
