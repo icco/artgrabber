@@ -6,8 +6,8 @@ require (
 	github.com/bwmarrin/discordgo v0.29.0
 	github.com/dropbox/dropbox-sdk-go-unofficial/v6 v6.6.1
 	github.com/go-chi/chi/v5 v5.3.2
-	github.com/icco/gutil v1.0.23
 	github.com/prometheus/client_golang v1.24.1
+	go.icco.me/gutil v1.0.27-0.20260929105600-f3e11752b837
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/exporters/prometheus v0.68.0
@@ -39,8 +39,8 @@ require (
 	go.opentelemetry.io/otel/sdk v1.46.0 // indirect
 	go.opentelemetry.io/otel/trace v1.46.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/crypto v0.55.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )

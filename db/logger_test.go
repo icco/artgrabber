@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/icco/gutil/logging"
+	"go.icco.me/gutil/logging"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 	"gorm.io/gorm/logger"
