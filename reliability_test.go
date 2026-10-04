@@ -193,7 +193,7 @@ func TestPartialBatchOnlyMarksUploadedFilesDelivered(t *testing.T) {
 			var uploaded []string
 			for {
 				part, err := reader.NextPart()
-				if err == io.EOF {
+				if errors.Is(err, io.EOF) {
 					break
 				}
 				if err != nil {
