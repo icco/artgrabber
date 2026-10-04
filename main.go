@@ -271,13 +271,10 @@ func initDropboxTokenSource(ctx context.Context) {
 
 // createDropboxClient creates a Dropbox client using OAuth2 token source.
 func createDropboxClient() files.Client {
-	currentToken, err := dropboxTokenSource.Token()
-	if err != nil {
-		log.Fatalw("Failed to get access token from token source", zap.Error(err))
-	}
-
+	// Refresh for every request, including continuation pages in long scans.
+	// A transient refresh failure is returned by the SDK, not fatal to the bot.
 	config := dropbox.Config{
-		Token: currentToken.AccessToken,
+		TokenSource: dropboxTokenSource,
 	}
 
 	return files.New(config)
@@ -290,14 +287,23 @@ func initDB() (*gorm.DB, error) {
 	}
 
 	dbPath := filepath.Join(dataDir, "artgrabber.db")
-	database, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+	database, err := gorm.Open(sqlite.Open(dbPath+"?_journal_mode=WAL&_busy_timeout=10000"), &gorm.Config{
 		Logger: artgrabberdb.NewGormLogger(log.Desugar()),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
+	sqlDB, err := database.DB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get database connection: %w", err)
+	}
+	// SQLite supports one writer. Serialize this process's scans, deliveries,
+	// reactions and cleanup rather than racing pooled write connections.
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
 
 	if err := database.AutoMigrate(&ImageFile{}, &MessageTracking{}); err != nil {
+		_ = sqlDB.Close()
 		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
 	}
 
@@ -594,12 +600,20 @@ func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo
 			Path: img.Path,
 		})
 		if err != nil {
-			l.Errorw("Failed to get file metadata from Dropbox, marking as delivered to skip",
+			var metadataErr files.GetMetadataAPIError
+			if errors.As(err, &metadataErr) && metadataErr.EndpointError != nil &&
+				metadataErr.EndpointError.Tag == files.GetMetadataErrorPath &&
+				metadataErr.EndpointError.Path != nil && metadataErr.EndpointError.Path.Tag == files.LookupErrorNotFound {
+				l.Infow("Skipping file removed from Dropbox", "path", img.Path)
+				if markErr := markAsDelivered(img.Path, time.Now()); markErr != nil {
+					l.Errorw("Failed to skip removed file", "path", img.Path, zap.Error(markErr))
+				}
+				continue
+			}
+			l.Errorw("Failed to get file metadata from Dropbox, will retry",
 				"path", img.Path,
 				zap.Error(err),
 			)
-			now := time.Now()
-			_ = markAsDelivered(img.Path, now)
 			continue
 		}
 
@@ -624,7 +638,8 @@ func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient fi
 		"batch_size", len(batch),
 	)
 
-	if err := downloadAndUploadBatch(ctx, dbxClient, dg, batch); err != nil {
+	deliveredPaths, err := downloadAndUploadBatch(ctx, dbxClient, dg, batch)
+	if err != nil {
 		l.Errorw("Failed to process batch",
 			"batch_size", len(batch),
 			zap.Error(err),
@@ -633,10 +648,10 @@ func processBatch(ctx context.Context, batch []*files.FileMetadata, dbxClient fi
 	}
 
 	now := time.Now()
-	for _, fileMetadata := range batch {
-		if err := markAsDelivered(fileMetadata.PathLower, now); err != nil {
+	for _, path := range deliveredPaths {
+		if err := markAsDelivered(path, now); err != nil {
 			l.Errorw("Failed to mark file as delivered",
-				"path", fileMetadata.PathDisplay,
+				"path", path,
 				zap.Error(err),
 			)
 		}
@@ -698,12 +713,12 @@ func getFilePathByMessageAndIndex(messageID string, index int) (string, error) {
 }
 
 // downloadAndUploadBatch downloads multiple files from Dropbox and uploads them in a single Discord message.
-func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *discordgo.Session, batch []*files.FileMetadata) error {
+func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *discordgo.Session, batch []*files.FileMetadata) ([]string, error) {
 	l := logging.FromContext(ctx)
 
 	cacheDir := filepath.Join(dataDir, "cache")
 	if err := os.MkdirAll(cacheDir, 0750); err != nil {
-		return fmt.Errorf("failed to create cache directory: %w", err)
+		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
 	// Discord has a file size limit (8MB for free, 50MB for Nitro).
@@ -712,6 +727,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 	var discordFiles []*discordgo.File
 	var cacheFiles []string
 	var paths []string
+	var deliveredPaths []string
 	var fileNames []string
 
 	defer func() {
@@ -731,8 +747,6 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 			continue
 		}
 
-		cacheFile := filepath.Join(cacheDir, filepath.Base(metadata.PathLower))
-
 		downloadArg := files.NewDownloadArg(metadata.PathLower)
 		_, content, err := dbxClient.Download(downloadArg)
 		if err != nil {
@@ -743,8 +757,9 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 			continue
 		}
 
-		// #nosec G304 -- cacheFile is safely constructed using filepath.Join with filepath.Base, preventing directory traversal
-		outFile, err := os.Create(cacheFile)
+		// Unique names prevent equal basenames in different Dropbox folders from
+		// overwriting a file already queued for this Discord message.
+		outFile, err := os.CreateTemp(cacheDir, "image-*")
 		if err != nil {
 			if closeErr := content.Close(); closeErr != nil {
 				l.Errorw("Error closing Dropbox content stream", zap.Error(closeErr))
@@ -755,6 +770,8 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 			)
 			continue
 		}
+		cacheFile := outFile.Name()
+		cacheFiles = append(cacheFiles, cacheFile)
 
 		if _, err := io.Copy(outFile, content); err != nil {
 			if closeErr := content.Close(); closeErr != nil {
@@ -775,9 +792,10 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		}
 		if closeErr := outFile.Close(); closeErr != nil {
 			l.Errorw("Error closing cache file", zap.Error(closeErr))
+			continue
 		}
 
-		// #nosec G304 -- cacheFile is safely constructed using filepath.Join with filepath.Base, preventing directory traversal
+		// #nosec G304 -- cacheFile was created by os.CreateTemp in our cache directory.
 		cachedFile, err := os.Open(cacheFile)
 		if err != nil {
 			l.Errorw("Failed to open cached file",
@@ -791,8 +809,8 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 			Name:   metadata.Name,
 			Reader: cachedFile,
 		})
-		cacheFiles = append(cacheFiles, cacheFile)
 		paths = append(paths, metadata.PathDisplay)
+		deliveredPaths = append(deliveredPaths, metadata.PathLower)
 		fileNames = append(fileNames, metadata.Name)
 
 		l.Infow("Downloaded image for batch upload",
@@ -803,7 +821,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 	}
 
 	if len(discordFiles) == 0 {
-		return fmt.Errorf("no files were successfully downloaded from batch")
+		return nil, fmt.Errorf("no files were successfully downloaded from batch")
 	}
 
 	defer func() {
@@ -832,7 +850,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		Files:   discordFiles,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to send files to Discord: %w", err)
+		return nil, fmt.Errorf("failed to send files to Discord: %w", err)
 	}
 
 	if err := storeMessageTracking(msg.ID, paths); err != nil {
@@ -857,7 +875,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		"message_id", msg.ID,
 	)
 
-	return nil
+	return deliveredPaths, nil
 }
 
 // formatBytes renders n as a human-readable size string.

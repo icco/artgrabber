@@ -145,8 +145,14 @@ task test       # Run tests
 - Check folder path (case-sensitive)
 
 **Token expired errors:**
-- Run `go run cmd/oauth-setup/main.go` to get fresh credentials
+- Access tokens refresh automatically between Dropbox requests, including pages of long scans.
+- Run `go run cmd/oauth-setup/main.go` if the refresh token itself has been revoked.
 - Verify all three OAuth variables are set (APP_KEY, APP_SECRET, REFRESH_TOKEN)
+
+**Database and delivery reliability:**
+- SQLite uses WAL mode and one pooled connection to avoid competing writers during scans, votes, and cleanup.
+- Stop the bot before copying its database, or use SQLite's backup API. Copying only a running `artgrabber.db` can omit data in its WAL file.
+- Transient metadata/download failures stay pending for a later delivery attempt. Only successfully uploaded files are marked delivered; permanently missing Dropbox files are skipped.
 
 **Duplicate uploads:**
 - Ensure `/data` volume persists between restarts
