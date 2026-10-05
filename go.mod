@@ -7,7 +7,7 @@ require (
 	github.com/dropbox/dropbox-sdk-go-unofficial/v6 v6.6.2
 	github.com/go-chi/chi/v5 v5.3.2
 	github.com/prometheus/client_golang v1.24.1
-	go.icco.me/gutil v1.0.27-0.20260929105600-f3e11752b837
+	go.icco.me/gutil v1.0.27
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/exporters/prometheus v0.68.0
