@@ -35,3 +35,33 @@ func TestStoreDiscoveredFilesSkipsDuplicateContentHash(t *testing.T) {
 		t.Fatalf("stored files = %d, want 1", count)
 	}
 }
+
+func TestRandomUndeliveredImagesSkipsOversizedFiles(t *testing.T) {
+	testDB, err := gorm.Open(sqlite.Open("file:oversized?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testDB.AutoMigrate(&ImageFile{}); err != nil {
+		t.Fatal(err)
+	}
+	previousDB := db
+	db = testDB
+	t.Cleanup(func() { db = previousDB })
+
+	for _, f := range []ImageFile{
+		{Path: "/alice.jpg", Size: discordMaxFileSize},
+		{Path: "/bob.png", Size: discordMaxFileSize + 1},
+	} {
+		if err := db.Create(&f).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := randomUndeliveredImages(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Path != "/alice.jpg" {
+		t.Fatalf("randomUndeliveredImages = %+v, want only /alice.jpg", got)
+	}
+}
