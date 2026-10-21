@@ -28,7 +28,7 @@ LABEL org.opencontainers.image.licenses=MIT
 
 # Install ca-certificates for HTTPS and sqlite runtime library.
 # Build tools (gcc, git, etc.) are NOT needed at runtime.
-RUN apk --no-cache add ca-certificates sqlite-libs
+RUN apk --no-cache upgrade ca-certificates ca-certificates-bundle && apk --no-cache add ca-certificates sqlite-libs
 
 WORKDIR /app
 
