@@ -41,6 +41,9 @@ const service = "artgrabber"
 
 var log = logging.Must(logging.NewLogger(service))
 
+// discordMaxFileSize is Discord's upload limit for bots without Nitro.
+const discordMaxFileSize = uint64(8 * 1024 * 1024)
+
 // ImageFile is an image discovered in Dropbox; the table is "processed_files"
 // for backwards compatibility.
 type ImageFile struct {
@@ -573,12 +576,7 @@ func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo
 	l := logging.FromContext(ctx)
 	const maxBatchSize = 10
 
-	var undeliveredFiles []ImageFile
-	err := db.WithContext(ctx).Model(&ImageFile{}).
-		Where("delivered_at IS NULL").
-		Order("RANDOM()").
-		Limit(maxBatchSize).
-		Find(&undeliveredFiles).Error
+	undeliveredFiles, err := randomUndeliveredImages(ctx, maxBatchSize)
 
 	if err != nil {
 		l.Errorw("Failed to query random undelivered images", zap.Error(err))
@@ -629,6 +627,18 @@ func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo
 	if len(batch) > 0 {
 		processBatch(ctx, batch, dbxClient, dg)
 	}
+}
+
+// randomUndeliveredImages returns up to limit random undelivered images small
+// enough to upload to Discord.
+func randomUndeliveredImages(ctx context.Context, limit int) ([]ImageFile, error) {
+	var images []ImageFile
+	err := db.WithContext(ctx).Model(&ImageFile{}).
+		Where("delivered_at IS NULL AND size <= ?", discordMaxFileSize).
+		Order("RANDOM()").
+		Limit(limit).
+		Find(&images).Error
+	return images, err
 }
 
 // processBatch processes a batch of files and uploads them in a single message.
@@ -721,9 +731,6 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
-	// Discord has a file size limit (8MB for free, 50MB for Nitro).
-	maxSize := uint64(8 * 1024 * 1024)
-
 	var discordFiles []*discordgo.File
 	var cacheFiles []string
 	var paths []string
@@ -739,7 +746,7 @@ func downloadAndUploadBatch(ctx context.Context, dbxClient files.Client, dg *dis
 	}()
 
 	for _, metadata := range batch {
-		if metadata.Size > maxSize {
+		if metadata.Size > discordMaxFileSize {
 			l.Warnw("Skipping file: exceeds Discord limit (8MB)",
 				"path", metadata.PathDisplay,
 				"size", metadata.Size,
