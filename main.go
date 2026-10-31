@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox"
+	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/auth"
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/files"
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
@@ -466,13 +468,46 @@ func scanDropboxFolder(ctx context.Context, dbxClient files.Client, _ *discordgo
 
 	for result.HasMore {
 		continueArg := files.NewListFolderContinueArg(result.Cursor)
-		result, err = dbxClient.ListFolderContinue(continueArg)
+		result, err = listFolderContinueWithRetry(ctx, dbxClient, continueArg)
 		if err != nil {
 			l.Errorw("Failed to continue listing Dropbox folder", zap.Error(err))
 			return
 		}
 		storeDiscoveredFiles(ctx, result.Entries)
 	}
+}
+
+// listFolderContinueRetryDelays is the backoff between ListFolderContinue
+// attempts. Dropbox intermittently returns 5xx pages mid-scan.
+var listFolderContinueRetryDelays = []time.Duration{5 * time.Second, 30 * time.Second}
+
+// listFolderContinueWithRetry retries transient ListFolderContinue failures so
+// a single Dropbox 5xx does not abort the whole scan.
+func listFolderContinueWithRetry(ctx context.Context, dbxClient files.Client, arg *files.ListFolderContinueArg) (*files.ListFolderResult, error) {
+	l := logging.FromContext(ctx)
+	result, err := dbxClient.ListFolderContinue(arg)
+	for _, delay := range listFolderContinueRetryDelays {
+		if err == nil || !isTransientDropboxError(err) {
+			return result, err
+		}
+		l.Warnw("Retrying Dropbox folder continuation", "delay", delay, zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+		result, err = dbxClient.ListFolderContinue(arg)
+	}
+	return result, err
+}
+
+// isTransientDropboxError reports whether err is a Dropbox 5xx, rate limit,
+// or network failure that may succeed on retry.
+func isTransientDropboxError(err error) bool {
+	var serverErr auth.ServerError
+	var rateLimitErr auth.RateLimitAPIError
+	var netErr net.Error
+	return errors.As(err, &serverErr) || errors.As(err, &rateLimitErr) || errors.As(err, &netErr)
 }
 
 // storeDiscoveredFiles stores discovered image files in the database.
