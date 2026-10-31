@@ -466,13 +466,37 @@ func scanDropboxFolder(ctx context.Context, dbxClient files.Client, _ *discordgo
 
 	for result.HasMore {
 		continueArg := files.NewListFolderContinueArg(result.Cursor)
-		result, err = dbxClient.ListFolderContinue(continueArg)
+		result, err = listFolderContinueWithRetry(ctx, dbxClient, continueArg)
 		if err != nil {
 			l.Errorw("Failed to continue listing Dropbox folder", zap.Error(err))
 			return
 		}
 		storeDiscoveredFiles(ctx, result.Entries)
 	}
+}
+
+// listFolderContinueRetryDelays is the backoff between ListFolderContinue
+// attempts. Dropbox intermittently returns 5xx pages mid-scan.
+var listFolderContinueRetryDelays = []time.Duration{5 * time.Second, 30 * time.Second}
+
+// listFolderContinueWithRetry retries transient ListFolderContinue failures so
+// a single Dropbox 5xx does not abort the whole scan.
+func listFolderContinueWithRetry(ctx context.Context, dbxClient files.Client, arg *files.ListFolderContinueArg) (*files.ListFolderResult, error) {
+	l := logging.FromContext(ctx)
+	result, err := dbxClient.ListFolderContinue(arg)
+	for _, delay := range listFolderContinueRetryDelays {
+		if err == nil {
+			return result, nil
+		}
+		l.Warnw("Retrying Dropbox folder continuation", "delay", delay, zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+		result, err = dbxClient.ListFolderContinue(arg)
+	}
+	return result, err
 }
 
 // storeDiscoveredFiles stores discovered image files in the database.
