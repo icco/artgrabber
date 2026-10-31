@@ -265,7 +265,7 @@ func TestListFolderContinueRetriesTransientErrors(t *testing.T) {
 	dropboxTokenSource = &rotatingTokenSource{}
 	listFolderContinueRetryDelays = []time.Duration{0, 0}
 	requests := 0
-	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	http.DefaultTransport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		requests++
 		if requests == 1 {
 			return &http.Response{StatusCode: http.StatusInternalServerError, Header: http.Header{"Content-Type": {"text/html"}}, Body: io.NopCloser(strings.NewReader("<html>Dropbox - 500</html>"))}, nil
