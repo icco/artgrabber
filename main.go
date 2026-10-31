@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox"
+	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/auth"
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/files"
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
@@ -485,8 +487,8 @@ func listFolderContinueWithRetry(ctx context.Context, dbxClient files.Client, ar
 	l := logging.FromContext(ctx)
 	result, err := dbxClient.ListFolderContinue(arg)
 	for _, delay := range listFolderContinueRetryDelays {
-		if err == nil {
-			return result, nil
+		if err == nil || !isTransientDropboxError(err) {
+			return result, err
 		}
 		l.Warnw("Retrying Dropbox folder continuation", "delay", delay, zap.Error(err))
 		select {
@@ -497,6 +499,15 @@ func listFolderContinueWithRetry(ctx context.Context, dbxClient files.Client, ar
 		result, err = dbxClient.ListFolderContinue(arg)
 	}
 	return result, err
+}
+
+// isTransientDropboxError reports whether err is a Dropbox 5xx, rate limit,
+// or network failure that may succeed on retry.
+func isTransientDropboxError(err error) bool {
+	var serverErr auth.ServerError
+	var rateLimitErr auth.RateLimitAPIError
+	var netErr net.Error
+	return errors.As(err, &serverErr) || errors.As(err, &rateLimitErr) || errors.As(err, &netErr)
 }
 
 // storeDiscoveredFiles stores discovered image files in the database.

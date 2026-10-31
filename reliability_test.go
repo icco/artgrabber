@@ -279,3 +279,23 @@ func TestListFolderContinueRetriesTransientErrors(t *testing.T) {
 		t.Errorf("requests = %d, want 2", requests)
 	}
 }
+
+func TestListFolderContinueDoesNotRetryPermanentErrors(t *testing.T) {
+	oldSource, oldTransport, oldDelays := dropboxTokenSource, http.DefaultTransport, listFolderContinueRetryDelays
+	t.Cleanup(func() {
+		dropboxTokenSource, http.DefaultTransport, listFolderContinueRetryDelays = oldSource, oldTransport, oldDelays
+	})
+	dropboxTokenSource = &rotatingTokenSource{}
+	listFolderContinueRetryDelays = []time.Duration{0, 0}
+	requests := 0
+	http.DefaultTransport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{StatusCode: http.StatusConflict, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error_summary":"reset/","error":{".tag":"reset"}}`))}, nil
+	})
+	if _, err := listFolderContinueWithRetry(context.Background(), createDropboxClient(), files.NewListFolderContinueArg("cursor")); err == nil {
+		t.Fatal("expected error")
+	}
+	if requests != 1 {
+		t.Errorf("requests = %d, want 1", requests)
+	}
+}
