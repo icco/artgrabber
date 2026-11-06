@@ -585,10 +585,10 @@ func storeDiscoveredFiles(ctx context.Context, entries []files.IsMetadata) {
 	}
 }
 
-// deliverImagesPeriodically delivers images every 30 minutes.
+// deliverImagesPeriodically delivers images every hour.
 func deliverImagesPeriodically(ctx context.Context, dg *discordgo.Session) {
 	l := logging.FromContext(ctx)
-	ticker := time.NewTicker(30 * time.Minute)
+	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
 	dbxClient := createDropboxClient()
@@ -609,7 +609,7 @@ func deliverImagesPeriodically(ctx context.Context, dg *discordgo.Session) {
 // sendRandomImages queries the database for N random undelivered images and sends them.
 func sendRandomImages(ctx context.Context, dbxClient files.Client, dg *discordgo.Session) {
 	l := logging.FromContext(ctx)
-	const maxBatchSize = 10
+	const maxBatchSize = 5
 
 	undeliveredFiles, err := randomUndeliveredImages(ctx, maxBatchSize)
 
