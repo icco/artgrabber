@@ -7,7 +7,7 @@ A Discord bot that monitors a Dropbox folder for new images and automatically up
 - Monitors Dropbox folder recursively via OAuth2
 - Supports JPG, PNG, GIF, WebP, BMP
 - Automatic token refresh (no manual intervention)
-- SQLite tracking (no duplicate uploads)
+- Postgres tracking (no duplicate uploads)
 - Health check endpoints
 - Docker support
 - **Voting system**: React with number emojis (1️⃣-5️⃣) to copy images to wallpapers folder
@@ -67,7 +67,7 @@ go build -o artgrabber
 **Docker:**
 ```bash
 docker build -t artgrabber .
-docker run --rm --env-file .env -v artgrabber-data:/data -p 8080:8080 artgrabber
+docker run --rm --env-file .env -p 8080:8080 artgrabber
 ```
 
 **Task:** (see `task --list` for all commands)
@@ -79,7 +79,7 @@ task build && ./artgrabber
 
 1. Bot polls Dropbox folder every `POLL_INTERVAL` (default: 5 minutes)
 2. New images are downloaded and uploaded to Discord with numbered reactions (1️⃣-5️⃣)
-3. SQLite database tracks processed files to prevent duplicates
+3. Postgres tracks processed files to prevent duplicates
 4. Access tokens refresh automatically via OAuth2
 5. Users can vote for images by clicking the number reactions
 6. Voted images are automatically copied to the wallpapers folder in Dropbox
@@ -93,8 +93,10 @@ task build && ./artgrabber
 | `DROPBOX_APP_KEY` | Yes | - | Dropbox app key |
 | `DROPBOX_APP_SECRET` | Yes | - | Dropbox app secret |
 | `DROPBOX_REFRESH_TOKEN` | Yes | - | OAuth refresh token |
+| `DATABASE_URL` | Yes | - | Postgres URL, such as `postgres://artgrabber:secret@localhost:5432/artgrabber` |
 | `DROPBOX_FOLDER` | No | `/Photos/gallery-dl` | Folder to monitor |
 | `WALLPAPERS_FOLDER` | No | `/Photos/Wallpapers` | Folder for voted images |
+| `DATA_DIR` | No | `/data` | Download cache, and where a legacy `artgrabber.db` is imported from |
 | `POLL_INTERVAL` | No | `5m` | Check interval |
 | `PORT` | No | `8080` | HTTP server port |
 
@@ -150,13 +152,11 @@ task test       # Run tests
 - Verify all three OAuth variables are set (APP_KEY, APP_SECRET, REFRESH_TOKEN)
 
 **Database and delivery reliability:**
-- SQLite uses WAL mode and one pooled connection to avoid competing writers during scans, votes, and cleanup.
-- Stop the bot before copying its database, or use SQLite's backup API. Copying only a running `artgrabber.db` can omit data in its WAL file.
+- On startup, an `artgrabber.db` SQLite file in `DATA_DIR` is copied into Postgres when Postgres has no files yet, then renamed to `artgrabber.db.imported`.
 - Transient metadata/download failures stay pending for a later delivery attempt. Only successfully uploaded files are marked delivered; permanently missing Dropbox files are skipped.
 
 **Duplicate uploads:**
-- Ensure `/data` volume persists between restarts
-- Check `/data/artgrabber.db` exists and is not corrupted
+- Check `DATABASE_URL` points at the same database across restarts
 
 **Files too large:**
 - Discord limit: 8MB (50MB with Nitro)

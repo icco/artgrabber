@@ -1,8 +1,7 @@
 # Build stage
 FROM golang:1.27-alpine AS builder
 
-# Install build dependencies (including C dependencies for sqlite3)
-RUN apk add --no-cache git ca-certificates gcc musl-dev sqlite-dev
+RUN apk add --no-cache git ca-certificates
 
 WORKDIR /app
 
@@ -13,11 +12,10 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy source code
-COPY main.go ./
+COPY *.go ./
 COPY db ./db
 
-# Build the application with CGO enabled
-RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o artgrabber .
+RUN CGO_ENABLED=0 GOOS=linux go build -o artgrabber .
 
 # Runtime stage
 FROM alpine:3.24
@@ -26,9 +24,7 @@ LABEL org.opencontainers.image.source=https://github.com/icco/artgrabber
 LABEL org.opencontainers.image.description="Discord bot that watches a Dropbox folder for new images and posts them to a Discord channel; reaction voting copies favorites to a wallpapers folder."
 LABEL org.opencontainers.image.licenses=MIT
 
-# Install ca-certificates for HTTPS and sqlite runtime library.
-# Build tools (gcc, git, etc.) are NOT needed at runtime.
-RUN apk --no-cache upgrade ca-certificates ca-certificates-bundle && apk --no-cache add ca-certificates sqlite-libs
+RUN apk --no-cache upgrade ca-certificates ca-certificates-bundle && apk --no-cache add ca-certificates
 
 WORKDIR /app
 
@@ -49,7 +45,7 @@ USER app
 # Expose the HTTP server port
 EXPOSE 8080
 
-# Define volume for persistent database storage
+# Download cache and legacy SQLite import source
 VOLUME ["/data"]
 
 # Run the bot
