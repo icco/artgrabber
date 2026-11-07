@@ -5,21 +5,10 @@ import (
 	"testing"
 
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/files"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
 )
 
 func TestStoreDiscoveredFilesSkipsDuplicateContentHash(t *testing.T) {
-	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := testDB.AutoMigrate(&ImageFile{}); err != nil {
-		t.Fatal(err)
-	}
-	previousDB := db
-	db = testDB
-	t.Cleanup(func() { db = previousDB })
+	setupTestDB(t)
 
 	entries := []files.IsMetadata{
 		&files.FileMetadata{Metadata: files.Metadata{Name: "one.jpg", PathLower: "/one.jpg", PathDisplay: "/one.jpg"}, ContentHash: "same", Size: 1},
@@ -37,16 +26,7 @@ func TestStoreDiscoveredFilesSkipsDuplicateContentHash(t *testing.T) {
 }
 
 func TestRandomUndeliveredImagesSkipsOversizedFiles(t *testing.T) {
-	testDB, err := gorm.Open(sqlite.Open("file:oversized?mode=memory&cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := testDB.AutoMigrate(&ImageFile{}); err != nil {
-		t.Fatal(err)
-	}
-	previousDB := db
-	db = testDB
-	t.Cleanup(func() { db = previousDB })
+	setupTestDB(t)
 
 	for _, f := range []ImageFile{
 		{Path: "/alice.jpg", Size: discordMaxFileSize},

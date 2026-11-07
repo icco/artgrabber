@@ -34,7 +34,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
-	"gorm.io/driver/sqlite"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -81,6 +81,7 @@ var (
 	pollInterval        time.Duration
 	port                string
 	dataDir             string
+	databaseURL         string
 	db                  *gorm.DB
 	dropboxTokenSource  oauth2.TokenSource // For auto-refreshing tokens
 
@@ -121,6 +122,7 @@ func main() {
 	dropboxFolder = os.Getenv("DROPBOX_FOLDER")
 	wallpapersFolder = os.Getenv("WALLPAPERS_FOLDER")
 	dataDir = os.Getenv("DATA_DIR")
+	databaseURL = os.Getenv("DATABASE_URL")
 	port = os.Getenv("PORT")
 	pollIntervalStr := os.Getenv("POLL_INTERVAL")
 
@@ -132,6 +134,9 @@ func main() {
 	}
 	if dropboxAppKey == "" || dropboxAppSecret == "" || dropboxRefreshToken == "" {
 		log.Fatalw("Dropbox OAuth credentials required: DROPBOX_APP_KEY, DROPBOX_APP_SECRET, and DROPBOX_REFRESH_TOKEN. Run 'go run cmd/oauth-setup/main.go' to set up.")
+	}
+	if databaseURL == "" {
+		log.Fatalw("DATABASE_URL environment variable is required")
 	}
 
 	log.Infow("Using Dropbox OAuth2 refresh token authentication")
@@ -167,9 +172,12 @@ func main() {
 		"poll_interval", pollInterval,
 	)
 
-	db, err = initDB()
+	db, err = initDB(databaseURL)
 	if err != nil {
 		log.Fatalw("Failed to initialize database", zap.Error(err))
+	}
+	if err := importSQLite(ctx, db, filepath.Join(dataDir, legacySQLiteFile)); err != nil {
+		log.Fatalw("Failed to import legacy SQLite database", zap.Error(err))
 	}
 	defer func() {
 		sqlDB, err := db.DB()
@@ -285,34 +293,26 @@ func createDropboxClient() files.Client {
 	return files.New(config)
 }
 
-// initDB initializes the GORM database.
-func initDB() (*gorm.DB, error) {
-	if err := os.MkdirAll(dataDir, 0750); err != nil {
-		return nil, fmt.Errorf("failed to create data directory: %w", err)
+// initDB connects to Postgres at dsn and migrates the schema.
+func initDB(dsn string) (*gorm.DB, error) {
+	if dsn == "" {
+		return nil, errors.New("database URL is required")
 	}
-
-	dbPath := filepath.Join(dataDir, "artgrabber.db")
-	database, err := gorm.Open(sqlite.Open(dbPath+"?_journal_mode=WAL&_busy_timeout=10000"), &gorm.Config{
+	database, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
 		Logger: artgrabberdb.NewGormLogger(log.Desugar()),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
-	sqlDB, err := database.DB()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get database connection: %w", err)
-	}
-	// SQLite supports one writer. Serialize this process's scans, deliveries,
-	// reactions and cleanup rather than racing pooled write connections.
-	sqlDB.SetMaxOpenConns(1)
-	sqlDB.SetMaxIdleConns(1)
 
 	if err := database.AutoMigrate(&ImageFile{}, &MessageTracking{}); err != nil {
-		_ = sqlDB.Close()
+		if sqlDB, dbErr := database.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
 		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
 	}
 
-	log.Infow("Database initialized", "db_path", dbPath)
+	log.Infow("Database initialized")
 	return database, nil
 }
 

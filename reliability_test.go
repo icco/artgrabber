@@ -78,30 +78,14 @@ func TestDropboxRefreshFailureIsReturned(t *testing.T) {
 
 func setupReliabilityDB(t *testing.T) {
 	t.Helper()
-	oldDB, oldDir := db, dataDir
+	oldDir := dataDir
 	dataDir = t.TempDir()
-	var err error
-	db, err = initDB()
-	if err != nil {
-		t.Fatal(err)
-	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = sqlDB.Close(); db, dataDir = oldDB, oldDir })
+	t.Cleanup(func() { dataDir = oldDir })
+	setupTestDB(t)
 }
 
-func TestDatabaseSerializesConcurrentWriters(t *testing.T) {
+func TestDatabaseHandlesConcurrentWriters(t *testing.T) {
 	setupReliabilityDB(t)
-	var mode string
-	if err := db.Raw("PRAGMA journal_mode").Scan(&mode).Error; err != nil || mode != "wal" {
-		t.Fatalf("journal mode = %q, error = %v", mode, err)
-	}
-	sqlDB, _ := db.DB()
-	if sqlDB.Stats().MaxOpenConnections != 1 {
-		t.Fatal("SQLite writers are not serialized")
-	}
 	var wg sync.WaitGroup
 	for i := range 20 {
 		wg.Go(func() {
