@@ -67,7 +67,7 @@ go build -o artgrabber
 **Docker:**
 ```bash
 docker build -t artgrabber .
-docker run --rm --env-file .env -p 8080:8080 artgrabber
+docker run --rm --env-file .env -v artgrabber-data:/data -p 8080:8080 artgrabber
 ```
 
 **Task:** (see `task --list` for all commands)

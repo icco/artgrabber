@@ -105,3 +105,40 @@ func TestImportSQLiteSkipsWhenPostgresHasFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestImportSQLiteRollsBackOnFailure(t *testing.T) {
+	setupTestDB(t)
+	path := filepath.Join(t.TempDir(), legacySQLiteFile)
+	writeLegacySQLite(t, path,
+		[]ImageFile{{Path: "/erin.jpg", Size: 1}},
+		[]MessageTracking{{MessageID: "1", FilePath: "/erin.jpg", CreatedAt: time.Now()}},
+	)
+	if err := db.Exec("ALTER TABLE message_trackings ADD CONSTRAINT reject_erin CHECK (file_path <> '/erin.jpg')").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := importSQLite(context.Background(), db, path); err == nil {
+		t.Fatal("import succeeded, want message tracking failure")
+	}
+
+	var count int64
+	if err := db.Model(&ImageFile{}).Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("files after failed import = %d, error = %v", count, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("legacy database moved after failed import: %v", err)
+	}
+
+	if err := db.Exec("ALTER TABLE message_trackings DROP CONSTRAINT reject_erin").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := importSQLite(context.Background(), db, path); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if err := db.Model(&ImageFile{}).Count(&count).Error; err != nil || count != 1 {
+		t.Fatalf("files after retry = %d, error = %v", count, err)
+	}
+	if err := db.Model(&MessageTracking{}).Count(&count).Error; err != nil || count != 1 {
+		t.Fatalf("message tracking after retry = %d, error = %v", count, err)
+	}
+}
