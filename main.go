@@ -46,6 +46,9 @@ var log = logging.Must(logging.NewLogger(service))
 // discordMaxFileSize is Discord's upload limit for bots without Nitro.
 const discordMaxFileSize = uint64(8 * 1024 * 1024)
 
+// discordHTTPTimeout replaces discordgo's 20s default, which large image batches exceed.
+const discordHTTPTimeout = 2 * time.Minute
+
 // ImageFile is an image discovered in Dropbox; the table is "processed_files"
 // for backwards compatibility.
 type ImageFile struct {
@@ -194,6 +197,7 @@ func main() {
 	if err != nil {
 		log.Fatalw("Error creating Discord session", zap.Error(err))
 	}
+	dg.Client.Timeout = discordHTTPTimeout
 
 	dg.AddHandler(messageReactionAddHandler)
 
