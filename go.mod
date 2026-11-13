@@ -4,11 +4,11 @@ go 1.27.3
 
 require (
 	github.com/bwmarrin/discordgo v0.29.0
-	github.com/dropbox/dropbox-sdk-go-unofficial/v6 v6.6.2
+	github.com/dropbox/dropbox-sdk-go-unofficial/v6 v6.6.3
 	github.com/glebarez/sqlite v1.11.0
 	github.com/go-chi/chi/v5 v5.5.0
 	github.com/prometheus/client_golang v1.25.0
-	go.icco.me/gutil v1.0.36
+	go.icco.me/gutil v1.0.39
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/prometheus v0.69.0
