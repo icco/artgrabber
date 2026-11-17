@@ -27,6 +27,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	artgrabberdb "go.icco.me/artgrabber/db"
 	"go.icco.me/gutil/logging"
+	"go.icco.me/gutil/tracing"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
@@ -37,6 +38,7 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	gormtracing "gorm.io/plugin/opentelemetry/tracing"
 )
 
 const service = "artgrabber"
@@ -98,6 +100,18 @@ var (
 func main() {
 	ctx, cancel := context.WithCancel(logging.NewContext(context.Background(), log))
 	defer cancel()
+
+	shutdown, err := tracing.Init(ctx, service)
+	if err != nil {
+		log.Fatalw("tracing init", zap.Error(err))
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := shutdown(shutdownCtx); err != nil {
+			log.Warnw("tracing shutdown", zap.Error(err))
+		}
+	}()
 
 	registry := prometheus.NewRegistry()
 	exporter, err := otelprom.New(otelprom.WithRegisterer(registry))
@@ -194,6 +208,9 @@ func main() {
 	if err != nil {
 		log.Fatalw("Error creating Discord session", zap.Error(err))
 	}
+	if dg.Client != nil {
+		dg.Client.Transport = otelhttp.NewTransport(dg.Client.Transport)
+	}
 
 	dg.AddHandler(messageReactionAddHandler)
 
@@ -223,7 +240,7 @@ func main() {
 
 	handler := otelhttp.NewHandler(r, service,
 		otelhttp.WithFilter(func(req *http.Request) bool {
-			return req.URL.Path != "/metrics"
+			return req.URL.Path != "/metrics" && req.URL.Path != "/health" && req.URL.Path != "/ready"
 		}),
 	)
 
@@ -303,6 +320,10 @@ func initDB(dsn string) (*gorm.DB, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	if err := database.Use(gormtracing.NewPlugin(gormtracing.WithoutMetrics())); err != nil {
+		return nil, fmt.Errorf("failed to register tracing plugin: %w", err)
 	}
 
 	if err := database.AutoMigrate(&ImageFile{}, &MessageTracking{}); err != nil {
